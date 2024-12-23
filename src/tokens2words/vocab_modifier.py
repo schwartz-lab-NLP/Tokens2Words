@@ -16,6 +16,7 @@ from copy import deepcopy
 from .representation_translator import RepresentationTranslators
 from .word_retriever import PatchscopesRetriever
 from .utils.calibration_utils import get_calibration_model, train_calibration_model, merge_calibrators_to_hf_model
+from .utils.model_utils import extract_token_i_hidden_states
 
 
 class VocabularyModifier(ABC):
@@ -325,19 +326,15 @@ class HeuristicDetokenizationVocabularyExpander(VocabularyModifier):
             model: PreTrainedModel,
             tokenizer: PreTrainedTokenizer,
             translators: RepresentationTranslators = None,
-            detokenization_layer: int = 3,
+            detokenization_layer: int = 5,
             embedding_detokenization_layer: int = None,
             **kwargs
     ):
         super().__init__(model, tokenizer, **kwargs)
 
         self.detokenization_layer = detokenization_layer
-        self.detokenization_layer = detokenization_layer
         self.embedding_detokenization_layer = embedding_detokenization_layer if embedding_detokenization_layer is not None else detokenization_layer
         self.translators = translators
-
-    def _decide_detokenization_end_layer(self, word: str):
-        return self.detokenization_layer
 
     def compute_entries_for_word(
             self, word: str
@@ -348,13 +345,12 @@ class HeuristicDetokenizationVocabularyExpander(VocabularyModifier):
             word (str):
                 ...
         """
-        # TODO replace patchscopes
-        last_token_hidden_states = self.patchscopes_retriever.extract_hidden_states(word)
+        last_token_hidden_states = extract_token_i_hidden_states(
+            self.model, self.tokenizer, word, token_idx_to_extract=-1,
+            return_dict=False, verbose=False)
 
-        target_layer = target_layer_E = self._decide_detokenization_end_layer(word)
-        if self.detokenization_decision_rule_E is not None:
-            target_layer_E = self._decide_detokenization_end_layer(
-                word, patchscopes_description_by_layers, self.detokenization_decision_rule_E)
+        target_layer = self.detokenization_layer
+        target_layer_E = self.embedding_detokenization_layer
 
         target_as_embedding = last_token_hidden_states[target_layer_E]
         target_as_lm_head = last_token_hidden_states[target_layer]
