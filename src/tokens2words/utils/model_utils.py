@@ -76,7 +76,7 @@ def extract_vocab_hidden_states(
             prompts = [prompt.replace(prompt_target, target) for target in tokens_to_extract[i:i+batch_size]]
             input_ids = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")["input_ids"]
             # input_ids = tokenizer(prompts, return_tensors="pt")["input_ids"]
-            outputs = model(input_ids.to(device), output_hidden_states=True)
+            outputs = model.encoder(input_ids.to(device), output_hidden_states=True)
             for layer in layers_to_extract:
                 hidden_states = outputs.hidden_states[layer]
                 all_hidden_states[layer].append(hidden_states[:, -1, :].detach().cpu())

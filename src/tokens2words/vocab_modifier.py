@@ -15,6 +15,7 @@ from copy import deepcopy
 
 from .representation_translator import RepresentationTranslators
 from .word_retriever import PatchscopesRetriever
+from .utils.calibration_utils import get_calibration_model, train_calibration_model, merge_calibrators_to_hf_model
 
 
 class VocabularyModifier(ABC):
@@ -47,6 +48,8 @@ class VocabularyModifier(ABC):
         self.failed_words: List[str] = list()
         self.entries_cache = {"embedding": dict(), "lm_head": dict()}
 
+        self.calibrators = None
+
     @abstractmethod
     def free_memory(self) -> None:
         pass
@@ -63,9 +66,13 @@ class VocabularyModifier(ABC):
 
         Returns:
             embedding entry (torch.Tensor): The transformed representation in embedding space.
-            unembedidng entry (torch.Tensor): The transformed representation in LM head space.
+            lm_head entry (torch.Tensor): The transformed representation in LM head space.
         """
         pass
+
+    def undo_vocabulary_changes(self) -> None:
+        self.tokenizer = deepcopy(self.base_tokenizer)
+        self.model.resize_token_embeddings(len(self.base_tokenizer))
 
     def add_words_to_core_vocab(self, words: List[str], token_ids: List[int]) -> None:
         # Create a temporary directory
@@ -90,13 +97,17 @@ class VocabularyModifier(ABC):
             self.tokenizer = AutoTokenizer.from_pretrained(temp_dir)
 
     def add_word_to_vocab(
-            self, word: str, finalize: bool = True
-    ) -> None:
-        embedding_entry, lm_head_entry = self.compute_entries_for_word(word)
-        if embedding_entry is None or lm_head_entry is None:
-            # failed to compute new entries for word
-            self.failed_words.append(word)
-            return
+            self, word: str, embedding_entry: torch.Tensor = None, lm_head_entry: torch.Tensor = None, finalize: bool = True
+    ) -> bool:
+        if embedding_entry is not None or lm_head_entry is not None:
+            # use precomputed entry representations
+            pass
+        else:
+            embedding_entry, lm_head_entry = self.compute_entries_for_word(word)
+            if embedding_entry is None or lm_head_entry is None:
+                # failed to compute new entries for word
+                self.failed_words.append(word)
+                return
 
         if self.add_space_before_lowercase_words and word[0].islower():
             word = self.space_token + word
@@ -121,11 +132,19 @@ class VocabularyModifier(ABC):
                 self.entries_cache["embedding"][word] = embedding_entry
                 self.entries_cache["lm_head"][word] = lm_head_entry
 
+        return num_added_tokens > 0
+
     def add_words_to_vocab(
-            self, words: Iterable[str]
+            self, words: Iterable[str],
+            precomputed_embedding_entries: Dict[str, torch.Tensor] = None,
+            precomputed_lm_head_entries: Dict[str, torch.Tensor] = None,
     ):
-        for word in tqdm(words, total=len(words), desc="Adding words to vocabulary...", unit="word"):
-            self.add_word_to_vocab(word, finalize=False)
+        if precomputed_embedding_entries is not None and precomputed_lm_head_entries is not None:
+            self.entries_cache["embedding"] = precomputed_embedding_entries
+            self.entries_cache["lm_head"] = precomputed_lm_head_entries
+        else:
+            for word in tqdm(words, total=len(words), desc="Computing entry representations for words...", unit="word"):
+                self.add_word_to_vocab(word, finalize=False)
 
         self.new_token_ids = list(range(self.orig_vocab_size, self.orig_vocab_size+len(self.new_words)))
         if self.add_to_core_vocab:
@@ -153,12 +172,41 @@ class VocabularyModifier(ABC):
         return {token_id: self.base_tokenizer.encode(word, add_special_tokens=False)
                 for word, token_id in zip(self.new_words, self.new_token_ids)}
 
+    def train_and_apply_calibrators_to_new_entries(self, dataset, save_dir=None, max_samples=None, lr=1e-4, lr_schedule="linear", num_epochs=1, batch_size=4, max_length=256, n_warmup_steps=0, clip_grad_norm=1.0, target_loss_weight=0.15, subsequent_loss_weight=0.15):
+        self.calibrators = self.train_calibrators(dataset, save_dir, max_samples, lr, lr_schedule, num_epochs, batch_size, max_length, n_warmup_steps, clip_grad_norm, target_loss_weight, subsequent_loss_weight)
+        self.apply_calibrators_to_new_entries()
+        return self.model
+
+    def train_calibrators(self, dataset, save_dir=None, max_samples=None, lr=1e-4, lr_schedule="linear", num_epochs=1, batch_size=4, max_length=256, n_warmup_steps=0, clip_grad_norm=1.0, target_loss_weight=0.15, subsequent_loss_weight=0.15):
+        calibration_model = get_calibration_model(self.model, self.orig_vocab_size, len(self.new_words), target_loss_weight, subsequent_loss_weight)
+
+        train_calibrators = True
+        if save_dir is not None:
+            calibrators_loaded = calibration_model.load_calibrators(save_dir, fail_ok=True)
+            train_calibrators = not calibrators_loaded
+        if train_calibrators:
+            calibration_model = train_calibration_model(calibration_model, self.tokenizer, dataset, save_dir, max_samples=max_samples, lr=lr, lr_schedule=lr_schedule, num_epochs=num_epochs, batch_size=batch_size, max_length=max_length, n_warmup_steps=n_warmup_steps, clip_grad_norm=clip_grad_norm)
+
+        calibrators = calibration_model.get_calibrators()
+        return calibrators
+
+    def apply_calibrators_to_new_entries(self, new_tokens_start=None, new_tokens_end=None, embedding_calibrator=None, lm_head_calibrator=None):
+        if self.calibrators is not None:
+            self.model = merge_calibrators_to_hf_model(self.model, **calibrators)
+        else:
+            assert (new_tokens_start is not None) and \
+                   ((embedding_calibrator is not None) or (lm_head_calibrator is not None)), \
+                   "To apply calibrators, you must either train them first or pass calibrators as parameters"
+
+            self.model = merge_calibrators_to_hf_model(
+                self.model,
+                new_tokens_start, new_tokens_end,
+                embedding_calibrator, lm_head_calibrator,
+            )
+        return self.model
+
 
 class DetokenizationVocabularyExpander(VocabularyModifier):
-    # TODO define patchscopes and its cache in init,
-    #  then if word is not present in cache add it to cache.
-    #  add func to dump and update cache
-
     def __init__(
             self,
             model: PreTrainedModel,
@@ -186,10 +234,6 @@ class DetokenizationVocabularyExpander(VocabularyModifier):
             self.patchscopes_results: DefaultDict[str, List[str]] = defaultdict(list)
 
         self.translators = translators
-
-    def free_memory(self) -> None:
-        del self.patchscopes_results
-        del self.translators
 
     def _decide_detokenization_end_layer(self, word: str, patchscopes_results: Iterable[str], decision_rule=None):
         decision_rule = self.detokenization_decision_rule if decision_rule is None else decision_rule
@@ -236,10 +280,6 @@ class DetokenizationVocabularyExpander(VocabularyModifier):
             # default to first id layer
             result = np.argmax(counts > 0).item()
 
-        # if result is not None:
-        #     # hack to change layer, TODO remove
-        #     return max(2, result-5)
-
         return result
 
     def compute_entries_for_word(
@@ -278,9 +318,48 @@ class DetokenizationVocabularyExpander(VocabularyModifier):
     def get_patchscopes_results(self):
         return pd.DataFrame.from_records(self.patchscopes_results)
 
-    def calibrate_new_lm_head_entries(self, dataset, lr=1e-4, lr_schedule="linear", num_epochs=1, max_length=256, n_warmup_steps=0, clip_grad_norm=1.0):
-        from .utils.calibration_utils import get_calibration_model, train_calibration_model, merge_calibrated_weights_to_hf_model
-        calibration_model = get_calibration_model(self.model, self.orig_vocab_size, len(self.new_words))
-        calibration_model = train_calibration_model(calibration_model, self.tokenizer, dataset, lr=lr, lr_schedule=lr_schedule, num_epochs=num_epochs, max_length=max_length, n_warmup_steps=n_warmup_steps, clip_grad_norm=clip_grad_norm)
-        self.model = merge_calibrated_weights_to_hf_model(calibration_model, self.model)
-        return self.model
+
+class HeuristicDetokenizationVocabularyExpander(VocabularyModifier):
+    def __init__(
+            self,
+            model: PreTrainedModel,
+            tokenizer: PreTrainedTokenizer,
+            translators: RepresentationTranslators = None,
+            detokenization_layer: int = 3,
+            embedding_detokenization_layer: int = None,
+            **kwargs
+    ):
+        super().__init__(model, tokenizer, **kwargs)
+
+        self.detokenization_layer = detokenization_layer
+        self.detokenization_layer = detokenization_layer
+        self.embedding_detokenization_layer = embedding_detokenization_layer if embedding_detokenization_layer is not None else detokenization_layer
+        self.translators = translators
+
+    def _decide_detokenization_end_layer(self, word: str):
+        return self.detokenization_layer
+
+    def compute_entries_for_word(
+            self, word: str
+    ) -> (torch.Tensor, torch.Tensor):
+        """
+
+        Args:
+            word (str):
+                ...
+        """
+        # TODO replace patchscopes
+        last_token_hidden_states = self.patchscopes_retriever.extract_hidden_states(word)
+
+        target_layer = target_layer_E = self._decide_detokenization_end_layer(word)
+        if self.detokenization_decision_rule_E is not None:
+            target_layer_E = self._decide_detokenization_end_layer(
+                word, patchscopes_description_by_layers, self.detokenization_decision_rule_E)
+
+        target_as_embedding = last_token_hidden_states[target_layer_E]
+        target_as_lm_head = last_token_hidden_states[target_layer]
+
+        target_as_embedding = self.translators.to_embedding(target_as_embedding, target_layer_E+1).to(self.model.get_input_embeddings().weight.dtype)
+        target_as_lm_head = self.translators.to_lm_head(target_as_lm_head, target_layer+1).to(self.model.get_output_embeddings().weight.dtype)
+
+        return target_as_embedding, target_as_lm_head

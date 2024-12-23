@@ -1,3 +1,4 @@
+import os
 import torch
 from torch import nn
 from tqdm import tqdm
@@ -14,171 +15,52 @@ import torch.optim as optim
 from ..utils.data_utils import load_lm_dataset, extract_new_words_from_dataset, get_group_texts_func, get_tokenize_func
 
 
-class OnlineLogitsStdDev:
-    def __init__(self, vocab_size, device='cpu'):
-        self.vocab_size = vocab_size
-        self.count = 0
-        self.mean = torch.zeros(vocab_size).to(device)
-        self.m2 = torch.zeros(vocab_size).to(device)
-
-    def update(self, logits_batch):
-        """
-        Update the online statistics with a new batch of logits.
-        Args:
-            logits_batch (torch.Tensor): A batch of logits of shape (batch_size, vocab_size).
-        """
-        batch_size = logits_batch.size(0)*logits_batch.size(1)
-        batch_mean = logits_batch.mean(dim=(0,1))
-        batch_var = logits_batch.var(dim=(0,1), unbiased=False)
-
-        delta = batch_mean - self.mean
-        total_count = self.count + batch_size
-
-        # Update mean
-        self.mean += delta * batch_size / total_count
-
-        # Update M2 (sum of squared differences from the mean)
-        self.m2 += batch_var * batch_size + (delta ** 2) * self.count * batch_size / total_count
-
-        # Update count
-        self.count = total_count
-
-    def std_dev(self):
-        """
-        Compute the standard deviation for each token in the vocabulary.
-        Returns:
-            torch.Tensor: A tensor of standard deviations of shape (vocab_size,).
-        """
-        return torch.sqrt(self.m2 / self.count) if self.count > 0 else torch.zeros(self.vocab_size)
-
-
-def compute_logits_std_dev(model, tokenizer, orig_vocab_size, dataset, batch_size=8, max_length=256, text_col_name="text"):
-
-    accelerator = Accelerator()
-
-    # Tokenize data
-    if tokenizer.bos_token is not None and max_length:
-        add_start_token = True
-        # leave room for <BOS> token to be added:
-        max_tokenized_len = max_length - 1
-    else:
-        add_start_token = False
-        max_tokenized_len = max_length
-
-    def _add_start_token(batch):
-        bos_tokens_tensor = torch.tensor([[tokenizer.bos_token_id]] * batch["input_ids"].size(dim=0)).to(batch["input_ids"].device)
-        batch["input_ids"] = torch.cat([bos_tokens_tensor, batch["input_ids"]], dim=1)
-        batch["attention_mask"] = torch.cat(
-            [torch.ones(bos_tokens_tensor.size(), dtype=torch.int64).to(batch["attention_mask"].device), batch["attention_mask"]], dim=1)
-        return batch
-
-    tokenize_function = get_tokenize_func(tokenizer, text_col_name)
-
-    column_names = dataset.column_names
-
-    with accelerator.main_process_first():
-        tokenized_dataset = dataset.map(
-            tokenize_function,
-            batched=True,
-            remove_columns=column_names,
-            load_from_cache_file=False,
-            desc="Running tokenizer on dataset",
-        )
-        group_texts = get_group_texts_func(block_size=max_tokenized_len)
-        lm_dataset = tokenized_dataset.map(
-            group_texts,
-            batched=True,
-        )
-
-    data_collator = default_data_collator
-
-    # Create data loaders
-    dataloader = DataLoader(
-        lm_dataset, collate_fn=data_collator, batch_size=batch_size, drop_last=False, shuffle=False,
-    )
-
-    model, dataloader = accelerator.prepare(model, dataloader)
-    online_std_dev_counter = OnlineLogitsStdDev(len(tokenizer), model.device)
-
-    model.eval()
-    for step, batch in tqdm(enumerate(dataloader), total=len(dataloader), miniters=10, unit="batches", desc="Computing logits' standard deviation...."):
-        if "labels" in batch:
-            batch.pop("labels")
-        if add_start_token:
-            batch = _add_start_token(batch)
-        with torch.no_grad():
-            outputs = model(**batch)
-        online_std_dev_counter.update(outputs.logits)
-
-    logits_std_dev = online_std_dev_counter.std_dev()
-    original_logits_std_dev = logits_std_dev[:orig_vocab_size]
-    logits_scales = original_logits_std_dev.mean() / logits_std_dev
-    logits_scales[:orig_vocab_size] = 1.0
-    return logits_std_dev, logits_scales.squeeze()
-
-
 class EmbeddingCalibrator(nn.Module):
-    def __init__(self, hidden_size, eps=1e-6, dtype=torch.bfloat16):
+    def __init__(self, hidden_size, lora_r=None, lora_alpha=None, dtype=torch.bfloat16):
         super().__init__()
-        # self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
-        # self.bias_weight = nn.Parameter(torch.zeros(hidden_size, dtype=dtype))
-        # self.bias = nn.Parameter(torch.zeros(1))
+        self.use_lora = lora_r is not None
 
-        self.weight = nn.Parameter(torch.zeros(hidden_size, hidden_size, dtype=dtype))
-
-        self.eps = eps
+        if not self.use_lora:
+            self.weight = nn.Parameter(torch.zeros(hidden_size, hidden_size, dtype=dtype))
+        else:
+            self.lora_scaling = lora_alpha / lora_r if lora_alpha is not None else 1.0
+            self.lora_A = nn.Parameter(torch.randn(lora_rank, hidden_size, dtype=dtype) * (1/lora_r))
+            self.lora_B = nn.Parameter(torch.zeros(hidden_size, lora_rank, dtype=dtype))
 
     def forward(self, x):
-        # norm = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
-        # return self.weight * (x / norm)
-        # return self.weight * x + self.bias
-        # return self.weight * x  # + torch.matmul(x, self.bias_weight.unsqueeze(-1))
-        return x + torch.matmul(x, self.weight.t())
+        if not self.use_lora:
+            return x + torch.matmul(x, self.weight.t())
+        else:
+            # Low-rank adaptation
+            lora_out = torch.matmul(x, self.lora_A.t())
+            lora_out = torch.matmul(lora_out, self.lora_B.t())
+            return x + self.lora_scaling * lora_out
 
 
-class LogitsCalibrator(nn.Module):
-    def __init__(self, vocab_size, dtype=torch.bfloat16):
-        super().__init__()
-        self.weight = nn.Linear(vocab_size, 1, dtype=dtype, bias=False)
-
-    def forward(self, logits):
-        return self.weight(logits)
-
-
-class LMHeadWithLogitsCalibration(nn.Module):
-    def __init__(self, lm_head, calibration_w, new_tokens_start_i):
-        super().__init__()
-        self.lm_head = lm_head
-        self.calibration_w = calibration_w
-        self.new_tokens_start_i = new_tokens_start_i
-
-    def forward(self, h):
-        logits = self.lm_head(h)
-        gamma = self.calibration_w(logits)
-        logits[..., self.new_tokens_start_i:] *= gamma
-        return logits
-
-
-# Add the RMSNorm layer for the new rows
-class ModifiedModel(nn.Module):
-    def __init__(self, base_model, lm_head, original_vocab_size, num_new_tokens, calibrate_lm_head=True, calibrate_embedding=True, calibrate_logits=False):
+class CalibrationModel(nn.Module):
+    def __init__(
+            self,
+            base_model, lm_head, original_vocab_size, num_new_tokens,
+            calibrate_embedding=True, calibrate_lm_head=True, empty_init=False,
+            lora_alpha=None, lora_r=None,
+            target_loss_weight=0.15, subsequent_loss_weight=0.15,
+    ):
         super().__init__()
         self.base_model = base_model
         self.lm_head = lm_head
         self.new_tokens_start = original_vocab_size
         self.new_tokens_end = original_vocab_size + num_new_tokens
-        self.unembedding_calibrator = EmbeddingCalibrator(base_model.config.hidden_size)
-        self.embedding_calibrator = EmbeddingCalibrator(base_model.config.hidden_size)
-        self.logits_calibrator = LogitsCalibrator(original_vocab_size+num_new_tokens)
+        
         self.calibrate_lm_head = calibrate_lm_head
         self.calibrate_embedding = calibrate_embedding
-        self.calibrate_logits = calibrate_logits
+        if not empty_init:
+            self.lm_Head_calibrator = EmbeddingCalibrator(base_model.config.hidden_size, lora_r, lora_alpha)
+            self.embedding_calibrator = EmbeddingCalibrator(base_model.config.hidden_size, lora_r, lora_alpha)
 
-        # self.loss_fct = nn.CrossEntropyLoss(reduction="mean")
         self.loss_fct = nn.CrossEntropyLoss(reduction="none")
-        self.original_tokens_loss_alpha = 0.6
-        self.subsequent_tokens_loss_alpha = 0.3
-        self.new_tokens_loss_alpha = 0.1
+        self.subsequent_tokens_loss_alpha = subsequent_loss_weight
+        self.new_tokens_loss_alpha = target_loss_weight
+        self.original_tokens_loss_alpha = 1 - self.new_tokens_loss_alpha - self.subsequent_tokens_loss_alpha
 
     def forward(self, input_ids, labels, attention_mask=None):
         # shift labels by 1 for CLM
@@ -201,7 +83,7 @@ class ModifiedModel(nn.Module):
             with torch.no_grad():
                 lm_head_weights = self.lm_head.weight
                 normed_weights = lm_head_weights.clone()
-            normed_weights[self.new_tokens_start:self.new_tokens_end] = self.unembedding_calibrator(lm_head_weights[self.new_tokens_start:self.new_tokens_end])
+            normed_weights[self.new_tokens_start:self.new_tokens_end] = self.lm_Head_calibrator(lm_head_weights[self.new_tokens_start:self.new_tokens_end])
             logits = torch.matmul(outputs['last_hidden_state'], normed_weights.T)
         else:
             if self.calibrate_embedding:
@@ -210,12 +92,6 @@ class ModifiedModel(nn.Module):
                 with torch.no_grad():
                     logits = self.lm_head(outputs['last_hidden_state'])
 
-        if self.calibrate_logits:
-            gamma = self.logits_calibrator(logits)
-            # Multiply only the last N tokens with gamma
-            logits = torch.cat((logits[..., :self.new_tokens_start], logits[..., self.new_tokens_start:] * gamma), dim=-1)
-
-        # loss = self.loss_fct(logits.view(-1, logits.size(-1)), labels.view(-1))
         per_example_loss = self.loss_fct(logits.transpose(1,2), labels)
         original_tokens_mask = labels < self.new_tokens_start
         new_tokens_mask = ~original_tokens_mask
@@ -231,30 +107,62 @@ class ModifiedModel(nn.Module):
 
         return {'loss': loss, 'logits': logits}
 
+    def get_calibrators(self):
+        embedding_calibrator = self.embedding_calibrator if self.calibrate_embedding else None
+        lm_Head_calibrator = self.lm_Head_calibrator if self.calibrate_lm_head else None
+        return {
+            "embedding_calibrator": embedding_calibrator,
+            "lm_head_calibrator": lm_Head_calibrator,
+            "new_tokens_start": self.new_tokens_start,
+            "new_tokens_end": self.new_tokens_end,
+        }
 
-def get_calibration_model(model, original_vocab_size, num_new_tokens):
-    modified_model = ModifiedModel(model.model, model.lm_head, original_vocab_size, num_new_tokens)
-    modified_model.base_model.eval()
-    modified_model.lm_head.eval()
+    def set_calibrators(self, embedding_calibrator=None, lm_head_calibrator=Nonee):
+        self.embedding_calibrator = embedding_calibrator
+        self.lm_Head_calibrator = lm_head_calibrator
+        
+    def save_calibrators(self, save_dir):
+        os.makedirs(save_dir, exist_ok=True)
+        if self.calibrate_embedding:
+            torch.save(self.embedding_calibrator, os.path.join(save_dir, "embedding_calibrator.pt"))
+        if self.calibrate_lm_head:
+            torch.save(self.lm_Head_calibrator, os.path.join(save_dir, "lm_Head_calibrator.pt"))
 
-    for param in modified_model.base_model.parameters():
+    def load_calibrators(self, load_dir, fail_ok=False):
+        """Loads the model's state dictionary from a file."""
+        try:
+            if self.calibrate_embedding:
+                self.embedding_calibrator = torch.load(os.path.join(load_dir, "embedding_calibrator.pt"))
+            if self.calibrate_lm_head:
+                self.lm_Head_calibrator = torch.load(os.path.join(load_dir, "lm_Head_calibrator.pt"))
+            return True
+        except:
+            if fail_ok:
+                return False
+            raise FileNotFoundError(f"Loading calibrators from '{load_dir}' failed")
+
+
+def get_calibration_model(model, original_vocab_size, num_new_tokens, target_loss_weight=0.15, subsequent_loss_weight=0.15):
+    calibrated_model = CalibrationModel(model.model, model.lm_head, original_vocab_size, num_new_tokens, target_loss_weight=target_loss_weight, subsequent_loss_weight=subsequent_loss_weight)
+    calibrated_model.base_model.eval()
+    calibrated_model.lm_head.eval()
+
+    for param in calibrated_model.base_model.parameters():
         param.requires_grad = False
-    for param in modified_model.lm_head.parameters():
+    for param in calibrated_model.lm_head.parameters():
         param.requires_grad = False
-    for param in modified_model.unembedding_calibrator.parameters():
+    for param in calibrated_model.lm_Head_calibrator.parameters():
         param.requires_grad = True
-    for param in modified_model.embedding_calibrator.parameters():
-        param.requires_grad = True
-    for param in modified_model.logits_calibrator.parameters():
+    for param in calibrated_model.embedding_calibrator.parameters():
         param.requires_grad = True
 
-    return modified_model
+    return calibrated_model
 
 
-def train_calibration_model(modified_model: ModifiedModel, tokenizer, dataset, filter_examples_without_new_tokens=True, lr=1e-4, lr_schedule="linear", num_epochs=1, batch_size=8, max_length=256, n_warmup_steps=0, text_col_name="text", clip_grad_norm=1.0):
+def train_calibration_model(calibrated_model: CalibrationModel, tokenizer, dataset, save_dir=None, max_samples=None, filter_examples_without_new_tokens=True, lr=1e-4, lr_schedule="linear", num_epochs=1, batch_size=8, max_length=256, n_warmup_steps=0, text_col_name="text", clip_grad_norm=1.0):
     accelerator = Accelerator()
     # Optimizer
-    optimizer = optim.AdamW(modified_model.parameters(), lr=lr)
+    optimizer = optim.AdamW(calibrated_model.parameters(), lr=lr)
 
     # Tokenize data
     if tokenizer.bos_token is not None and max_length:
@@ -291,8 +199,11 @@ def train_calibration_model(modified_model: ModifiedModel, tokenizer, dataset, f
         )
 
     if filter_examples_without_new_tokens:
-        examples_w_new_token = np.arange(len(lm_dataset))[np.any(np.array(lm_dataset['input_ids']) >= modified_model.new_tokens_start, axis=1)]
+        examples_w_new_token = np.arange(len(lm_dataset))[np.any(np.array(lm_dataset['input_ids']) >= calibrated_model.new_tokens_start, axis=1)]
         lm_dataset = lm_dataset.select(examples_w_new_token)
+
+    if max_samples is not None:
+        lm_dataset = lm_dataset.select(np.arange(max_samples))
 
     data_collator = default_data_collator
 
@@ -306,13 +217,13 @@ def train_calibration_model(modified_model: ModifiedModel, tokenizer, dataset, f
         n_warmup_steps = n_warmup_steps * len(dataloader)
     scheduler = get_scheduler(lr_schedule, optimizer=optimizer, num_warmup_steps=n_warmup_steps, num_training_steps=len(dataloader) * num_epochs)
 
-    modified_model, dataloader = accelerator.prepare(modified_model, dataloader)
+    calibrated_model, dataloader = accelerator.prepare(calibrated_model, dataloader)
 
     # Freeze the original lm_head weights
-    for param in modified_model.lm_head.parameters():
+    for param in calibrated_model.lm_head.parameters():
         param.requires_grad = False
 
-    modified_model.train()
+    calibrated_model.train()
     for epoch in tqdm(range(num_epochs), unit="epochs", desc="Fitting calibration"):
         total_loss = 0.0
         for step, batch in tqdm(enumerate(dataloader), total=len(dataloader), miniters=10, unit="batches"):
@@ -320,37 +231,57 @@ def train_calibration_model(modified_model: ModifiedModel, tokenizer, dataset, f
                 batch = _add_start_token(batch)
             batch["labels"] = batch["input_ids"]
             optimizer.zero_grad()
-            outputs = modified_model(**batch)
+            outputs = calibrated_model(**batch)
             loss = outputs['loss']
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(modified_model.parameters(), max_norm=clip_grad_norm)
+            torch.nn.utils.clip_grad_norm_(calibrated_model.parameters(), max_norm=clip_grad_norm)
             optimizer.step()
             scheduler.step()
 
-            # Log loss
             total_loss += loss.item()
 
-            if step % 10 == 0:
-                print(f"Epoch {epoch + 1}, Step {step}, Loss: {loss.item()}")
+            # # Log loss
+            # if step % 10 == 0:
+            #     print(f"Epoch {epoch + 1}, Step {step}, Loss: {loss.item()}")
 
         avg_loss = total_loss / len(dataloader)
         print(f"Epoch {epoch + 1} completed. Average Loss: {avg_loss}")
 
-    return modified_model
+    if save_dir is not None:
+        calibrated_model.save_calibrators(save_dir)
+
+    return calibrated_model
 
 
-def merge_calibrated_weights_to_hf_model(modified_model, hf_model):
-    if modified_model.calibrate_lm_head:
-        lm_head_weights = modified_model.lm_head.weight
-        normed_weights = modified_model.unembedding_calibrator(lm_head_weights[modified_model.new_tokens_start:modified_model.new_tokens_end])
+def merge_calibrators_to_hf_model(hf_model, new_tokens_start, new_tokens_end=None, embedding_calibrator=None, lm_head_calibrator=None):
+    if embedding_calibrator is not None:
+        embedding_weights = hf_model.get_input_embeddings().weight
         with torch.no_grad():
-            hf_model.lm_head.weight.data[modified_model.new_tokens_start:modified_model.new_tokens_end] = normed_weights
-    if modified_model.calibrate_embedding:
-        embedding_weights = modified_model.base_model.get_input_embeddings().weight
-        normed_weights = modified_model.embedding_calibrator(embedding_weights[modified_model.new_tokens_start:modified_model.new_tokens_end])
+            calibrated_weights = embedding_calibrator(embedding_weights[new_tokens_start:new_tokens_end])
+            hf_model.model.embed_tokens.weight.data[
+            new_tokens_start:new_tokens_end] = calibrated_weights
+
+    if lm_head_calibrator is not None:
+        lm_head_weights = hf_model.get_output_embeddings().weight
         with torch.no_grad():
-            hf_model.model.embed_tokens.weight.data[modified_model.new_tokens_start:modified_model.new_tokens_end] = normed_weights
-    if modified_model.calibrate_logits:
-        new_lm_head = LMHeadWithLogitsCalibration(hf_model.lm_head, modified_model.logits_calibrator.weight, modified_model.new_tokens_start)
-        hf_model.lm_head = new_lm_head
+            calibrated_weights = lm_Head_calibrator(lm_head_weights[new_tokens_start:new_tokens_end])
+            hf_model.lm_head.weight.data[new_tokens_start:new_tokens_end] = calibrated_weights
+
     return hf_model
+
+
+def merge_calibration_model_to_hf_model(hf_model, calibrated_model):
+    accelerator = Accelerator()
+    calibrated_model, hf_model = accelerator.prepare(calibrated_model, hf_model)
+    if calibrated_model.calibrate_lm_head:
+        lm_head_weights = calibrated_model.lm_head.weight
+        normed_weights = calibrated_model.lm_Head_calibrator(lm_head_weights[calibrated_model.new_tokens_start:calibrated_model.new_tokens_end])
+        with torch.no_grad():
+            hf_model.lm_head.weight.data[calibrated_model.new_tokens_start:calibrated_model.new_tokens_end] = normed_weights
+    if calibrated_model.calibrate_embedding:
+        embedding_weights = calibrated_model.base_model.get_input_embeddings().weight
+        normed_weights = calibrated_model.embedding_calibrator(embedding_weights[calibrated_model.new_tokens_start:calibrated_model.new_tokens_end])
+        with torch.no_grad():
+            hf_model.model.embed_tokens.weight.data[calibrated_model.new_tokens_start:calibrated_model.new_tokens_end] = normed_weights
+    return hf_model
+

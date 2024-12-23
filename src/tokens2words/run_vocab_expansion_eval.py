@@ -15,6 +15,7 @@ from tqdm import tqdm
 import torch
 from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, default_data_collator
+from tokenizers import AddedToken
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from collections import defaultdict
@@ -38,33 +39,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
-def _clip_overly_excited_new_logits(logits, vocab_size=32000, max_line=0.95, gamma=2.0, deletion_value=-10.0, **kwargs):
-    if logits.size(-1) == vocab_size:
-        return logits
-    logits = logits.clone()
-    new_logits = logits[..., vocab_size:]
-    orig_logits_topk = logits[..., :vocab_size].topk(new_logits.size(-1), dim=-1).values
-    orig_max_val = orig_logits_topk.max(-1, keepdims=True).values
-    new_max_val = new_logits.max(-1, keepdims=True).values
-    close_to_max_rate_orig = ((orig_logits_topk / orig_max_val) > max_line).to(torch.float32).mean(dim=-1)
-    close_to_max_rate_new = ((new_logits / orig_max_val) > max_line).to(torch.float32).mean(dim=-1)
-    # close_to_new_max_rate_new = ((new_logits / new_max_val) > max_line).to(torch.float32).mean(dim=-1)
-    over_excited_mask = close_to_max_rate_new >= gamma*close_to_max_rate_orig
-    updated_logits = logits[over_excited_mask]
-    updated_logits[:, vocab_size:] = deletion_value
-    logits[over_excited_mask] = updated_logits
-    return logits, over_excited_mask
-
-
 def eval_lm(
         model, accelerator, tokenizer, baseline_tokenizer, dataset,
         batch_size: int = 4,
         top_ks=[5, 10],
-        new_token_ids=None, replaced_token_seqs_by_len=None, new_token_to_original_first_token=None,
+        new_token_ids=None, replaced_token_seqs_by_len=None,
+        new_token_to_original_first_token=None, new_token_to_original_token_len=None,
         text_col_name: str = "text",
         max_length: int = 256,
         eval_max_samples: int = None,
-        clip_logits_kwargs: dict = None,
 ):
     model.eval()
     if tokenizer.bos_token is not None and max_length:
@@ -142,36 +125,38 @@ def eval_lm(
         "baseline": defaultdict(list),
         "expanded_E": defaultdict(list),
         "fully_expanded": defaultdict(list),
-        "clipped_expanded": defaultdict(list),
+        # "clipped_expanded": defaultdict(list),
     }
 
     background_metrics = deepcopy(target_metrics)
+    overall_metrics = deepcopy(target_metrics)
+    other_metrics = dict()
 
     # for perplexity
     ce_loss_func = nn.CrossEntropyLoss(reduction="none")
-
-    # for clipping logits
-    if clip_logits_kwargs is None:
-        clip_logits_kwargs = dict()
 
     # TODO consider not aggregating results here, to enable metrics for specific words
     def _compute_metrics(
             model, tokenizer, logits, labels, attention_mask, original_labels=None,
             compute_target_metrics=True, compute_subsequent_metrics=True, compute_perplexity=False,
-            clip_logits_kwargs=None,
+            return_successful_targets=False,
             debug=False):
         target_results = dict()  # will hold metrics for all the new words we add or their original tokenization
         background_results = dict()  # will hold metrics for all background tokens, i.e., not the ones we add or replace
+        overall_results = dict()  # will hold metrics for all tokens
+        successful_targets = None  # will hold list of target tokens successfully predicted
         if compute_subsequent_metrics:
             # prepare labels and attentions masks for computing metrics only for the 1st tokens following the new words
             subsequent_labels = labels[:,  1:]
             subsequent_attention_mask = get_last_zero_in_every_seq_mask(attention_mask[..., :-1].contiguous())
             subsequent_attention_mask_bool = subsequent_attention_mask == 1
         attention_mask_bool = attention_mask == 1
+        overall_mask_bool = attention_mask_bool
 
         if compute_target_metrics:
             target_mask = get_first_zero_in_every_seq_mask(attention_mask)
             target_mask_bool = target_mask == 1
+            overall_mask_bool = attention_mask_bool | target_mask_bool
 
         if compute_perplexity:
             background_results["perplexity"] = torch.exp(
@@ -179,24 +164,26 @@ def eval_lm(
                 / attention_mask.sum(1)
             ).mean().detach().cpu().numpy()
 
-        if clip_logits_kwargs is not None and clip_logits_kwargs["clip_new_logits"]:
-            logits, over_excited_mask = _clip_overly_excited_new_logits(
-                logits, **clip_logits_kwargs)
-
         top1 = logits.argmax(dim=-1)
 
         if compute_target_metrics:
             target_results["top1_acc"] = ((labels == top1)[target_mask_bool]).detach().cpu().numpy()
-            if original_labels is not None:  # TODO check target_mask is for the right token, and not the one after it
-                # target_results["original_top1_acc"] = (
-                #             (original_labels == top1)[target_mask_bool]).detach().cpu().numpy()
+            if original_labels is not None:
                 target_results["sum_top1_acc"] = (
                     ((original_labels == top1) | (labels == top1))[target_mask_bool]).detach().cpu().numpy()
+            if return_successful_targets:
+                successful_targets = (labels[(labels == top1) & target_mask_bool]).detach().cpu().numpy()
 
         background_results["top1_acc"] = ((
                              labels == top1)[attention_mask_bool]).detach().cpu().numpy()
         if compute_subsequent_metrics:
             background_results["subsequent_top1_acc"] = ((subsequent_labels == top1[:, 1:])[subsequent_attention_mask_bool]).detach().cpu().numpy()
+
+        overall_results["top1_acc"] = ((labels == top1))[overall_mask_bool].detach().cpu().numpy()
+        if original_labels is not None:
+            overall_results["sum_top1_acc"] = (
+                ((original_labels == top1) | (labels == top1)))[overall_mask_bool].detach().cpu().numpy()
+
         for top_k in top_ks:
             topk = logits.topk(top_k, dim=-1).indices
             background_results[f"top{top_k}_acc"] = ((topk == labels.unsqueeze(-1)).any(
@@ -214,6 +201,13 @@ def eval_lm(
                         ((topk == original_labels.unsqueeze(-1)) | (topk == labels.unsqueeze(-1))).any(
                         dim=-1)[target_mask_bool]).detach().cpu().numpy()
 
+            overall_results[f"top{top_k}_acc"] = ((topk == labels.unsqueeze(-1))[overall_mask_bool].any(
+                dim=-1)).detach().cpu().numpy()
+            if original_labels is not None:
+                overall_results[f"sum_top{top_k}_acc"] = (
+                    ((topk == original_labels.unsqueeze(-1)) | (topk == labels.unsqueeze(-1)))[overall_mask_bool].any(
+                    dim=-1)).detach().cpu().numpy()
+
         rank = compute_topk_token_rank(logits, labels)
         background_results["mrr"] = ((1 / rank)[attention_mask_bool]).detach().cpu().numpy()
         if compute_subsequent_metrics:
@@ -225,10 +219,16 @@ def eval_lm(
                 orig_rank = compute_topk_token_rank(logits, original_labels)
                 # target_results["original_mrr"] = ((1 / orig_rank)[target_mask_bool]).detach().cpu().numpy()
                 target_results["sum_mrr"] = ((1 / torch.minimum(orig_rank, rank))[target_mask_bool]).detach().cpu().numpy()
+
+        overall_results["mrr"] = ((1 / rank)[overall_mask_bool]).detach().cpu().numpy()
+        if original_labels is not None:
+            orig_rank = compute_topk_token_rank(logits, original_labels)
+            overall_results["sum_mrr"] = ((1 / torch.minimum(orig_rank, rank))[overall_mask_bool]).detach().cpu().numpy()
+
         if debug:
             import pdb; pdb.set_trace()
         del rank
-        return background_results, target_results
+        return background_results, target_results, overall_results, successful_targets
 
     def _add_start_token(batch):
         bos_tokens_tensor = torch.tensor([[tokenizer.bos_token_id]] * batch["input_ids"].size(dim=0)).to(batch["input_ids"].device)
@@ -287,11 +287,13 @@ def eval_lm(
         else:
             shift_logits = shift_logits
 
-        background_results, target_results = _compute_metrics(model, tokenizer, shift_logits, shift_labels, shift_attention_mask_batch, compute_perplexity=True)
+        background_results, target_results, overall_results, successful_targets = _compute_metrics(model, tokenizer, shift_logits, shift_labels, shift_attention_mask_batch, compute_perplexity=True)
         for metric_name, metric_value in target_results.items():
             target_metrics['baseline'][metric_name].append(metric_value)
         for metric_name, metric_value in background_results.items():
             background_metrics['baseline'][metric_name].append(metric_value)
+        for metric_name, metric_value in overall_results.items():
+            overall_metrics['baseline'][metric_name].append(metric_value)
 
     baseline_vocab_dataloader = accelerator.free_memory(baseline_vocab_dataloader)
 
@@ -318,22 +320,17 @@ def eval_lm(
         shift_attention_mask_batch, ignore_mask = _ignore_new_words_in_attention_mask(shift_attention_mask_batch, shift_labels)
         original_labels = None if new_token_to_original_first_token is None \
             else new_token_to_orig_first_mapping_tensor[shift_labels]
-        background_results, target_results = \
+        background_results, target_results, overall_results, successful_targets = \
             _compute_metrics(model, tokenizer, shift_logits, shift_labels, shift_attention_mask_batch,
-                             original_labels=original_labels, debug=False)
+                             original_labels=original_labels, return_successful_targets=True, debug=False)
         for metric_name, metric_value in target_results.items():
             target_metrics['fully_expanded'][metric_name].append(metric_value)
         for metric_name, metric_value in background_results.items():
             background_metrics['fully_expanded'][metric_name].append(metric_value)
-
-        if clip_logits_kwargs is not None and clip_logits_kwargs["clip_new_logits"]:
-            background_results, target_results = \
-                _compute_metrics(model, tokenizer, shift_logits, shift_labels, shift_attention_mask_batch,
-                                 original_labels=original_labels, debug=False, clip_logits_kwargs=clip_logits_kwargs)
-            for metric_name, metric_value in target_results.items():
-                target_metrics['clipped_expanded'][metric_name].append(metric_value)
-            for metric_name, metric_value in background_results.items():
-                background_metrics['clipped_expanded'][metric_name].append(metric_value)
+        for metric_name, metric_value in overall_results.items():
+            overall_metrics['fully_expanded'][metric_name].append(metric_value)
+        if successful_targets is not None:
+            target_metrics['fully_expanded']["successful_targets"].append(successful_targets)
 
         if new_token_ids is not None:
             # output vocab is expanded - to compute input-only expansion baseline, need to remove logits for new words
@@ -341,30 +338,42 @@ def eval_lm(
                 [shift_logits[:, :, :min(new_token_ids)], shift_logits[:, :, max(new_token_ids) + 1:]], dim=-1)
         else:
             shift_logits = shift_logits
-        background_results, _ = _compute_metrics(model, tokenizer, shift_logits, shift_labels,
+        background_results, _, overall_results, _ = _compute_metrics(model, tokenizer, shift_logits, shift_labels,
                                                  shift_attention_mask_batch, compute_target_metrics=False)
-        _, target_results = _compute_metrics(model, tokenizer, shift_logits, original_labels,
+        _, target_results, _ , _= _compute_metrics(model, tokenizer, shift_logits, original_labels,
                                                  shift_attention_mask_batch, compute_target_metrics=True)
         for metric_name, metric_value in background_results.items():
             background_metrics['expanded_E'][metric_name].append(metric_value)
         for metric_name, metric_value in target_results.items():
             target_metrics['expanded_E'][metric_name].append(metric_value)
+        for metric_name, metric_value in overall_results.items():
+            overall_metrics['expanded_E'][metric_name].append(metric_value)
 
     expanded_vocab_dataloader = accelerator.free_memory(expanded_vocab_dataloader)
     gc.collect()
     torch.cuda.empty_cache()
+
+    # handle successfully saved tokens counts
+    if "successful_targets" in target_metrics["fully_expanded"]:
+        if new_token_to_original_token_len is not None:
+            successful_targets = np.concatenate(target_metrics['fully_expanded']["successful_targets"])
+            successful_targets_token_counts = np.vectorize(new_token_to_original_token_len.get)(successful_targets)
+            other_metrics["successful_pred_saved_tokens"] = successful_targets_token_counts.sum().item() - len(successful_targets_token_counts)
+            other_metrics["successful_pred_original_token_len"] = successful_targets_token_counts.sum().item()
+        target_metrics['fully_expanded'].pop("successful_targets")
+
     for eval_type in target_metrics.keys():
         target_metrics[eval_type] = {metric: np.nanmean(np.concatenate([np.atleast_1d(v) for v in results_list])) for metric, results_list in target_metrics[eval_type].items()}
     for eval_type in background_metrics.keys():
         background_metrics[eval_type] = {metric: np.nanmean(np.concatenate([np.atleast_1d(v) for v in results_list])) for metric, results_list in background_metrics[eval_type].items()}
+    for eval_type in overall_metrics.keys():
+            overall_metrics[eval_type] = {metric: np.nanmean(np.concatenate([np.atleast_1d(v) for v in results_list])) for metric, results_list in overall_metrics[eval_type].items()}
 
-    other_metrics = {
-        "total_tokens": {
+    other_metrics["total_tokens"] = {
             "baseline": baseline_vocab_total_tokens,
             "expanded": new_vocab_total_tokens,
-        },
     }
-    return background_metrics, target_metrics, other_metrics
+    return background_metrics, target_metrics, other_metrics, overall_metrics
 
 
 def get_word_filter(args):
@@ -397,18 +406,25 @@ def prepare_new_words(
         new_words = [w for w in new_words if not tokenizer.vocab.get(w, False) and _word_filter(w, _get_token_length(w))]
 
     if args.words_dataset:
-        words_dataset = load_lm_dataset(args.words_dataset, args.words_dataset_language)
+        words_dataset = load_lm_dataset(args.words_dataset, language=args.words_dataset_language)
+        if args.words_dataset_overlap_split is not None:
+            words_overlap_dataset = words_dataset[args.words_dataset_overlap_split]
+            new_words_from_overlap_data, new_words_from_doverlap_data_freqs = extract_new_words_from_dataset(
+                words_overlap_dataset, tokenizer, args.words_dataset_text_col, filter_func=_word_filter)
+
         words_dataset = words_dataset[args.words_dataset_split]
-        if args.words_dataset_max_samples:
-            words_dataset = words_dataset.select(range(args.words_dataset_max_samples))
 
         new_words_from_data, new_words_from_data_freqs = extract_new_words_from_dataset(
             words_dataset, tokenizer, args.words_dataset_text_col, filter_func=_word_filter)
 
+        if args.words_dataset_overlap_split is not None:
+            new_words_from_data = list(set(new_words_from_data).intersection(new_words_from_overlap_data))
+
     if args.words_filter_min_freq is not None:
-            new_words_from_data = [word for word in new_words_from_data if new_words_from_data_freqs[word] >= args.words_filter_min_freq]
+        new_words_from_data = [word for word in new_words_from_data if new_words_from_data_freqs[word] >= args.words_filter_min_freq]
 
     topline_tokenizer = deepcopy(tokenizer)
+    topline_tokenizer_wo_normalize = deepcopy(tokenizer)
     n_new_words = topline_tokenizer.add_tokens(new_words_from_data)
     baseline_vocab_total_tokens = count_tokens_in_dataset(words_dataset, tokenizer, args.words_dataset_text_col)
     max_vocab_total_tokens = count_tokens_in_dataset(words_dataset, topline_tokenizer, args.words_dataset_text_col)
@@ -431,17 +447,26 @@ def prepare_patchscopes_retriever(args, model, tokenizer):
     )
 
     patchscopes_results = None
-    if args.patchscopes_results_cache is not None:
-        patchscopes_results = pd.read_parquet(args.patchscopes_results_cache)
+    try:
+        if args.patchscopes_results_cache is not None:
+            patchscopes_results = pd.read_parquet(args.patchscopes_results_cache)
+    except:
+        pass
 
     return patchscopes_retriever, patchscopes_results
 
 
 def prepare_translators(args, model, tokenizer):
-
+    save_translators = True
     if args.translators_path:
-        translators = torch.load(args.translators_path, map_location=torch.device('cpu'))
-    elif args.translators_use_procrustes:
+        try:
+            translators = torch.load(args.translators_path, map_location=torch.device('cpu'))
+            save_translators = False
+            return translators, save_translators
+        except:
+            pass
+
+    if args.translators_use_procrustes:
         translators = ProcrustesRepresentationTranslators()
         translators.fit_on_tokens(
             model, tokenizer,
@@ -473,7 +498,7 @@ def prepare_translators(args, model, tokenizer):
             min_word_len=args.translators_fit_min_word_len,
         )
 
-    return translators
+    return translators, save_translators
 
 
 def main(args):
@@ -491,8 +516,6 @@ def main(args):
     # dump new words to file
     with open(os.path.join(output_dir, "new_words.txt"), "w") as fp:
         fp.write("\n".join(new_words))
-    # # for debugging
-    # new_words = new_words[:100]
 
     logger.info("Loading model...")
     mixed_precision = "bf16" if torch.cuda.is_bf16_supported() else "fp16"
@@ -505,14 +528,19 @@ def main(args):
         )
         model.config.num_hidden_layers = args.early_exit_layer
     model = accelerator.prepare(model)
-
     logger.info("Running patchscopes on new words...")
     patchscopes_retriever, patchscopes_results = prepare_patchscopes_retriever(args, model, baseline_tokenizer)
 
-    logger.info("Preparing transformations to embedding and unembedding spaces...")
-    translators = prepare_translators(args, model, tokenizer)
-    if not args.translators_path:
-        torch.save(translators, os.path.join(output_dir, "translators.pt"))
+    logger.info("Preparing transformations to embedding and lm_head spaces...")
+    translators, save_translators = prepare_translators(args, model, tokenizer)
+    os.makedirs(output_dir, exist_ok=True)
+    if save_translators:
+        if args.translators_path is not None:
+            os.makedirs(os.path.dirname(args.translators_path), exist_ok=True)
+            torch.save(translators, args.translators_path)
+        else:
+            os.makedirs(output_dir, exist_ok=True)
+            torch.save(translators, os.path.join(output_dir, f"translators.pt"))
 
     logger.info("Adding new words to model vocabulary...")
     model.eval()
@@ -529,56 +557,52 @@ def main(args):
     )
     model, tokenizer = vocab_modifier.add_words_to_vocab(new_words)
 
-    if args.rescale_logits:
-        from .utils.calibration_utils import compute_logits_std_dev
-        calibration_dataset = load_lm_dataset(args.calibration_dataset)
-        calibration_dataset = calibration_dataset[args.calibration_dataset_split]
-        logits_std_dev, logits_scales = compute_logits_std_dev(model, tokenizer, vocab_modifier.orig_vocab_size, calibration_dataset)
-        with torch.no_grad():
-            model.lm_head.weight.data *= logits_scales.unsqueeze(-1)
-
-    if args.calibrate_new_lm_head:
-        logger.info("Calibrating new LM head entries...")
-        calibration_dataset = load_lm_dataset(args.calibration_dataset)
-        calibration_dataset = calibration_dataset[args.calibration_dataset_split]
-        model = vocab_modifier.calibrate_new_lm_head_entries(calibration_dataset, lr=args.calibration_lr, lr_schedule=args.calibration_lr_schedule, num_epochs=args.calibration_num_epochs, max_length=256, n_warmup_steps=args.calibration_n_warmup_steps, clip_grad_norm=args.calibration_clip_grad_norm,)
-
-    logger.info("Done adding words! Patchscopes success rate: "
-                f"{len(vocab_modifier.new_words) / (len(vocab_modifier.new_words) + len(vocab_modifier.failed_words))}")
-
     updated_patchscopes_results = vocab_modifier.get_patchscopes_results()
     if patchscopes_results is None or len(updated_patchscopes_results) > len(patchscopes_results):
         logger.info("Saving updated patchscopes cache to file...")
         patchscopes_results = updated_patchscopes_results
-        if args.patchscopes_results_cache:
-            patchscopes_results.to_parquet(args.patchscopes_results_cache)
+        if args.patchscopes_results_cache is not None:
+            try:
+                os.makedirs(os.path.dirname(args.patchscopes_results_cache), exist_ok=True)
+                patchscopes_results.to_parquet(args.patchscopes_results_cache)
+            except:
+                patchscopes_results.to_parquet(
+                    os.path.join(output_dir, "patchscopes_results.parquet"))
         else:
             patchscopes_results.to_parquet(
                 os.path.join(output_dir, "patchscopes_results.parquet"))
 
-    # vocab_modifier.free_memory()
+    if args.calibrate_new_lm_head:
+        logger.info("Calibrating new LM head entries...")
+        calibration_dataset = load_lm_dataset(args.calibration_dataset, language=args.calibration_dataset_language)
+        calibration_dataset = calibration_dataset[args.calibration_dataset_split]
+        model = vocab_modifier.train_and_apply_calibrators_to_new_entries(calibration_dataset, save_dir=args.calibration_save_dir, max_samples=args.calibration_max_samples, lr=args.calibration_lr, lr_schedule=args.calibration_lr_schedule, num_epochs=args.calibration_num_epochs, batch_size=args.calibration_batch_size, max_length=args.eval_max_length, n_warmup_steps=args.calibration_n_warmup_steps, clip_grad_norm=args.calibration_clip_grad_norm, target_loss_weight=args.calibration_target_loss_weight, subsequent_loss_weight=args.calibration_subsequent_loss_weight)
+
+    logger.info("Done adding words! Patchscopes success rate: "
+                f"{len(vocab_modifier.new_words) / (len(vocab_modifier.new_words) + len(vocab_modifier.failed_words))}")
+
     del patchscopes_results
     gc.collect()
     torch.cuda.empty_cache()
 
     # compute metrics
-    eval_dataset = load_lm_dataset(args.eval_dataset, args.eval_dataset_language)
+    eval_dataset = load_lm_dataset(args.eval_dataset, language=args.eval_dataset_language)
     eval_dataset = eval_dataset[args.eval_dataset_split]
 
     new_tokens_to_replaced_token_seqs = vocab_modifier.get_new_tokens_to_replaced_token_seqs_map()
     seq_lens = {len(v) for v in new_tokens_to_replaced_token_seqs.values()}
     replaced_token_seqs_by_len = {curr_seq_len: [seq for seq in new_tokens_to_replaced_token_seqs.values() if len(seq) == curr_seq_len] for curr_seq_len in seq_lens}
     new_token_to_original_first_token = {k: v[0] for k, v in new_tokens_to_replaced_token_seqs.items()}
+    new_token_to_original_token_len = {k: len(v) for k, v in new_tokens_to_replaced_token_seqs.items()}
 
-    background_metrics, target_metrics, other_metrics = eval_lm(
+    background_metrics, target_metrics, other_metrics, overall_metrics = eval_lm(
         model, accelerator, tokenizer, baseline_tokenizer, eval_dataset,
-        batch_size=4, top_ks=[5, 10], new_token_ids=vocab_modifier.new_token_ids,
+        batch_size=args.eval_batch_size, top_ks=[5, 10], new_token_ids=vocab_modifier.new_token_ids,
         replaced_token_seqs_by_len=replaced_token_seqs_by_len,
         new_token_to_original_first_token=new_token_to_original_first_token,
+        new_token_to_original_token_len=new_token_to_original_token_len,
+        max_length=args.eval_max_length,
         eval_max_samples=args.eval_max_samples, text_col_name=args.eval_dataset_text_col,
-        clip_logits_kwargs={
-            "clip_new_logits": args.clip_new_logits, "vocab_size": len(baseline_tokenizer), "max_line": args.clip_max_line,
-            "gamma": args.clip_gamma},
     )
 
     other_metrics["n_new_words"] = len(vocab_modifier.new_words)
@@ -589,11 +613,14 @@ def main(args):
     print(other_metrics)
     background_df = pd.DataFrame.from_dict(background_metrics)
     target_df = pd.DataFrame.from_dict(target_metrics)
+    overall_df = pd.DataFrame.from_dict(overall_metrics)
     other_df = pd.DataFrame.from_dict(other_metrics)
     print(tabulate(background_df, headers='keys', tablefmt='psql'))
     print(tabulate(target_df, headers='keys', tablefmt='psql'))
+    print(tabulate(overall_df, headers='keys', tablefmt='psql'))
     background_df.to_json(os.path.join(output_dir, "metrics_background.json"), indent=4)
     target_df.to_json(os.path.join(output_dir, "metrics_target.json"), indent=4)
+    overall_df.to_json(os.path.join(output_dir, "metrics_overall.json"), indent=4)
     other_df.to_json(os.path.join(output_dir, "metrics_other.json"), indent=4)
 
     config = vars(args)
@@ -611,7 +638,6 @@ def parse_args():
     parser.add_argument("--exp_name", type=str)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.1-8B")
-    parser.add_argument("--run_old_eval", action="store_true", default=False)
     parser.add_argument("--add_new_words_to_core_vocab", action="store_true", default=False)
     parser.add_argument("--add_space_before_lowercase_words", action="store_true", default=False)
     parser.add_argument("--detokenization_decision_rule", type=str, default="first_id_layer")
@@ -634,24 +660,31 @@ def parse_args():
     parser.add_argument("--translators_procrustes_layers", nargs="+", type=int, default=None)
     parser.add_argument("--translators_learn_on_space_prefixed_words_only", action="store_true", default=False)
     parser.add_argument("--translators_fit_min_word_len", type=int, default=None)
-    parser.add_argument("--rescale_logits", action="store_true", default=False)
     parser.add_argument("--calibrate_new_lm_head", action="store_true", default=False)
+    parser.add_argument("--calibration_save_dir", type=str, default=None)
     parser.add_argument("--calibration_dataset", type=str, default=None)
     parser.add_argument("--calibration_dataset_split", type=str, default=None)
+    parser.add_argument("--calibration_dataset_language", type=str, default=None)
+    parser.add_argument("--calibration_batch_size", type=int, default=4)
     parser.add_argument("--calibration_lr", type=float, default=0.0001)
     parser.add_argument("--calibration_clip_grad_norm", type=float, default=1.0)
+    parser.add_argument("--calibration_target_loss_weight", type=float, default=0.15)
+    parser.add_argument("--calibration_subsequent_loss_weight", type=float, default=0.15)
     parser.add_argument("--calibration_lr_schedule", type=str, default="linear")
     parser.add_argument("--calibration_n_warmup_steps", type=float, default=0.03)
     parser.add_argument("--calibration_num_epochs", type=int, default=1)
+    parser.add_argument("--calibration_max_samples", type=int, default=None)
     parser.add_argument("--eval_dataset", type=str, default="wikitext")
     parser.add_argument("--eval_dataset_language", type=str, default=None)
     parser.add_argument("--eval_max_samples", type=int, default=None)
+    parser.add_argument("--eval_batch_size", type=int, default=4)
+    parser.add_argument("--eval_max_length", type=int, default=256)
     parser.add_argument("--eval_dataset_split", type=str, default="test")
     parser.add_argument("--eval_dataset_text_col", type=str, default="text")
     parser.add_argument("--words_dataset", type=str, default=None)
     parser.add_argument("--words_dataset_language", type=str, default=None)
-    parser.add_argument("--words_dataset_max_samples", type=int, default=None)
     parser.add_argument("--words_dataset_split", type=str, default="test")
+    parser.add_argument("--words_dataset_overlap_split", type=str, default=None)
     parser.add_argument("--words_dataset_text_col", type=str, default="text")
     parser.add_argument("--words_list", type=str, default=None)
     parser.add_argument("--words_list_delimiter", type=str, default=None)
@@ -659,9 +692,6 @@ def parse_args():
     parser.add_argument("--words_filter_max_n_tokens", type=int, default=5)
     parser.add_argument("--words_filter_non_en", action="store_true", default=False)
     parser.add_argument("--words_filter_numeric", action="store_true", default=False)
-    parser.add_argument("--clip_new_logits", action="store_true", default=True)
-    parser.add_argument("--clip_max_line", type=float, default=0.95)
-    parser.add_argument("--clip_gamma", type=float, default=2.0)
     parser.add_argument("--output_dir", type=str, default="./experiments/")
 
     args = parser.parse_args()

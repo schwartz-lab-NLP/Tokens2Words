@@ -4,7 +4,7 @@ from itertools import chain
 from tqdm import tqdm
 from collections import Counter
 
-LANGUAGES_TO_DECODE_FROM_BYTES = ["he"]
+LANGUAGES_TO_DECODE_FROM_BYTES = ["he", "fr", "uk"]
 STREAMING_DATASETS = ["fineweb-edu"]
 
 
@@ -24,6 +24,24 @@ def load_pg19_val_and_test():
     # test_dataset = load_dataset("deepmind/pg19", split="test")
 
     return DatasetDict({"validation": validation_dataset, "test": test_dataset})
+
+
+def load_pubmed(n_samples=10000):
+    # Load the dataset in streaming mode
+    streaming_dataset = load_dataset("MedRAG/pubmed", streaming=True)
+
+    # Extract test and validation splits
+    data = list(streaming_dataset["train"].take(n_samples*4))
+    train = data[:2*n_samples]
+    validation = data[2*n_samples:3*n_samples]
+    test = data[3*n_samples:]
+    # Convert them into regular datasets
+    train = Dataset.from_list(train)
+    validation = Dataset.from_list(validation)
+    test = Dataset.from_list(test)
+    dataset = DatasetDict({"train": train, 'validation': validation, 'test': test})
+    dataset = dataset.rename_column('content', 'text')
+    return dataset
 
 
 def load_lm_dataset(dataset_name, language="en", split=None):
@@ -50,6 +68,26 @@ def load_lm_dataset(dataset_name, language="en", split=None):
         return load_dataset("HuggingFaceFW/fineweb-edu", name="sample-10BT")
     elif dataset_name.lower() == 'wikitext-103':
         return load_dataset("Salesforce/wikitext", "wikitext-103-raw-v1", split=split)
+    elif dataset_name.lower() == 'cord19':
+        return load_dataset("allenai/cord19", "fulltext", trust_remote_code=True)
+    elif dataset_name.lower() == 'pubmed':
+        return load_pubmed()
+    elif dataset_name.lower() == 'wikilingua':
+        dataset = load_dataset("GEM/wiki_lingua", trust_remote_code=True)
+        dataset = dataset.filter(lambda ex: (ex['source_language'] == "en") & (ex['target_language'] == "en"))
+        dataset = dataset.rename_column("source", "text")
+        dataset = dataset.rename_column("target", "summary")
+        return dataset
+    elif dataset_name.lower() == 'xsum':
+        dataset = load_dataset("EdinburghNLP/xsum")
+        dataset = dataset.rename_column("document", "text")
+        return dataset
+    elif dataset_name.lower() == 'cnn':
+        dataset = load_dataset("abisee/cnn_dailymail", "3.0.0")
+        dataset = dataset.rename_column("article", "text")
+        dataset = dataset.rename_column("highlights", "summary")
+        dataset = dataset.map(lambda example: {"text": example["text"].replace("(CNN)", "")})
+        return dataset
     elif dataset_name.lower() == 'pg19':
         return load_pg19_val_and_test()
     elif dataset_name.lower() == 'wiki40b':

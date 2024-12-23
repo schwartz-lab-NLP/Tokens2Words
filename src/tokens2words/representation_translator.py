@@ -16,7 +16,7 @@ from .utils.procrustes.orthogonal import orthogonal as orthogonal_procrustes
 
 class RepresentationTranslators(ABC, nn.Module):
     """
-    Abstract class for mapping intermediate model representations to the model's embedding and unembedding spaces.
+    Abstract class for mapping intermediate model representations to the model's embedding and lm_head spaces.
     """
 
     def __init__(self):
@@ -32,9 +32,9 @@ class RepresentationTranslators(ABC, nn.Module):
             dataset: Union[List[str], Dataset, IterableDataset, "datasets.Dataset"],
     ) -> None:
         """
-        Learns transformations that map representations from every layer to the embedding/unembedding spaces,
+        Learns transformations that map representations from every layer to the embedding/lm_head spaces,
         by fitting a transformation from intermediate model representations of vocabulary tokens, as computed in
-        the dataset's examples, to the corresponding token rows in the embedding and unembedding matrices.
+        the dataset's examples, to the corresponding token rows in the embedding and lm_head matrices.
 
         Args:
             model (PreTrainedModel):
@@ -56,9 +56,9 @@ class RepresentationTranslators(ABC, nn.Module):
             prompt_target: str = "{target}",
     ) -> None:
         """
-        Learns transformations that map representations from every layer to the embedding/unembedding spaces,
+        Learns transformations that map representations from every layer to the embedding/lm_head spaces,
         by fitting a transformation from intermediate model representations of single tokens from the vocabulary,
-        as extracted using the given prompt, to the respective rows in the embedding and unembedding matrices.
+        as extracted using the given prompt, to the respective rows in the embedding and lm_head matrices.
 
         Args:
             model (PreTrainedModel):
@@ -93,13 +93,13 @@ class RepresentationTranslators(ABC, nn.Module):
     @abstractmethod
     def to_lm_head(self, representations: torch.Tensor, **kwargs) -> torch.Tensor:
         """
-        Transforms the given representations to the unembedding space.
+        Transforms the given representations to the lm_head space.
 
         Args:
             representations (torch.Tensor): The intermediate representations to transform.
 
         Returns:
-            torch.Tensor: The transformed representations in unembedding space.
+            torch.Tensor: The transformed representations in lm_head space.
         """
         pass
 
@@ -123,7 +123,7 @@ class RepresentationTranslators(ABC, nn.Module):
 
 class LinearRepresentationTranslators(RepresentationTranslators):
     """
-    Transforms intermediate model representations to the embedding and unembedding spaces
+    Transforms intermediate model representations to the embedding and lm_head spaces
     using linear maps.
     """
 
@@ -146,9 +146,9 @@ class LinearRepresentationTranslators(RepresentationTranslators):
             fit_intercept: bool = False,
     ) -> None:
         """
-        Learns transformations that map representations from every layer to the embedding/unembedding spaces,
+        Learns transformations that map representations from every layer to the embedding/lm_head spaces,
         by fitting a transformation from intermediate model representations of single tokens from the vocabulary,
-        as extracted using the given prompt, to the respective rows in the embedding and unembedding matrices.
+        as extracted using the given prompt, to the respective rows in the embedding and lm_head matrices.
 
         Args:
             model (PreTrainedModel):
@@ -186,7 +186,7 @@ class LinearRepresentationTranslators(RepresentationTranslators):
 
         n_layers = model.config.num_hidden_layers
         layer_batch_size = n_layers if layer_batch_size is None else layer_batch_size
-        for start_layer_i in tqdm(range(1, n_layers+1, layer_batch_size), desc="Fitting maps to embedding and unembedding spaces", unit="Layer batch"):
+        for start_layer_i in tqdm(range(1, n_layers+1, layer_batch_size), desc="Fitting maps to embedding and lm_head spaces", unit="Layer batch"):
             layers_to_learn = None if layer_batch_size is None else \
                 list(range(start_layer_i, min(start_layer_i + layer_batch_size, n_layers+1)))
             all_hidden_states = extract_vocab_hidden_states(model, tokenizer, token_ids, prompt, prompt_target, batch_size, layers_to_learn)
@@ -208,9 +208,9 @@ class LinearRepresentationTranslators(RepresentationTranslators):
             dataset: Union[List[str], Dataset, IterableDataset, "datasets.Dataset"],
     ) -> None:
         """
-        Learns transformations that map representations from every layer to the embedding/unembedding spaces,
+        Learns transformations that map representations from every layer to the embedding/lm_head spaces,
         by fitting a transformation from intermediate model representations of vocabulary tokens, as computed in
-        the dataset's examples, to the corresponding token rows in the embedding and unembedding matrices.
+        the dataset's examples, to the corresponding token rows in the embedding and lm_head matrices.
 
         Args:
             model (PreTrainedModel):
@@ -249,14 +249,14 @@ class LinearRepresentationTranslators(RepresentationTranslators):
 
     def to_lm_head(self, representations: torch.Tensor, layer_index: int, **kwargs) -> torch.Tensor:
         """
-        Transforms the given representations to the unembedding space.
+        Transforms the given representations to the lm_head space.
 
         Args:
             representations (torch.Tensor): The intermediate representations to transform.
             layer_index (int): The index of the model layer the representations were extracted from.
 
         Returns:
-            torch.Tensor: The transformed representations in unembedding space.
+            torch.Tensor: The transformed representations in lm_head space.
         """
         if self.lm_head_maps is None or str(layer_index) not in self.lm_head_maps:
             raise ValueError("The mapping has not been trained yet. Call fit first.")
@@ -281,8 +281,8 @@ class ProcrustesLayer(nn.Module):
         self.b_out = None if b_out is None else nn.Parameter(torch.tensor(b_out, dtype=torch.float32))
         self.b_in = None if b_in is None else nn.Parameter(torch.tensor(b_in, dtype=torch.float32))
 
-        self.alpha_out = None if alpha_out is None else nn.Parameter(torch.tensor(alpha_out, dtype=torch.float32))
-        self.alpha_in = None if alpha_in is None else nn.Parameter(torch.tensor(alpha_in, dtype=torch.float32))
+        self.alpha_out = None if alpha_out is None else nn.Parameter(alpha_out.clone().detach().to(torch.float32))
+        self.alpha_in = None if alpha_in is None else nn.Parameter(alpha_out.clone().detach().to(torch.float32))
 
         self.normalize = normalize
 
@@ -318,7 +318,7 @@ class ProcrustesLayer(nn.Module):
 
 class ProcrustesRepresentationTranslators(RepresentationTranslators):
     """
-    Transforms intermediate model representations to the embedding and unembedding spaces
+    Transforms intermediate model representations to the embedding and lm_head spaces
     using procrustes matrices.
     """
 
@@ -362,7 +362,7 @@ class ProcrustesRepresentationTranslators(RepresentationTranslators):
             translation_layers = list(range(1, n_layers+1))
         n_batches = int(math.ceil(len(translation_layers) / layer_batch_size))
         for batch_i in tqdm(range(n_batches),
-                                  desc="Fitting maps to embedding and unembedding spaces", unit="Layer batch"):
+                                  desc="Fitting maps to embedding and lm_head spaces", unit="Layer batch"):
             layers_to_learn = translation_layers[batch_i*layer_batch_size:(batch_i+1)*layer_batch_size]
             all_hidden_states = extract_vocab_hidden_states(model, tokenizer, token_ids, prompt, prompt_target,
                                                             batch_size, layers_to_learn)
@@ -378,15 +378,17 @@ class ProcrustesRepresentationTranslators(RepresentationTranslators):
                 curr_u = lm_head_weights - u_bias
                 curr_e = input_embeddings - e_bias
 
-                h_rms = torch.sqrt(torch.mean(curr_h ** 2, dim=-1, keepdim=True))
-                u_rms = torch.sqrt(torch.mean(curr_u ** 2, dim=-1, keepdim=True))
-                u_rms_mean = u_rms.mean()
-                e_rms = torch.sqrt(torch.mean(curr_e ** 2, dim=-1, keepdim=True))
-                u_sd = lm_head_weights.std(dim=-1).mean()
-                e_sd = input_embeddings.std(dim=-1).mean()
-                u_rms_gamma = model.model.norm.weight.detach().cpu()
-
                 if normalize:
+                    h_rms = torch.sqrt(torch.mean(curr_h ** 2, dim=-1, keepdim=True))
+                    u_rms = torch.sqrt(torch.mean(curr_u ** 2, dim=-1, keepdim=True))
+                    # u_rms_mean = u_rms.mean()
+                    # e_rms = torch.sqrt(torch.mean(curr_e ** 2, dim=-1, keepdim=True))
+                    u_sd = lm_head_weights.std(dim=-1).mean()
+                    # e_sd = input_embeddings.std(dim=-1).mean()
+                    # u_rms_gamma = model.model.norm.weight.detach().cpu()
+                    u_rms_gamma = 1
+
+
                     # # SD normalization
                     # curr_h_norm = curr_h / curr_h.std(-1).unsqueeze(1)
                     # curr_u_norm = curr_u / curr_u.std(-1).unsqueeze(1)
@@ -438,9 +440,9 @@ class ProcrustesRepresentationTranslators(RepresentationTranslators):
             dataset: Union[List[str], Dataset, IterableDataset, "datasets.Dataset"],
     ) -> None:
         """
-        Learns transformations that map representations from every layer to the embedding/unembedding spaces,
+        Learns transformations that map representations from every layer to the embedding/lm_head spaces,
         by fitting a transformation from intermediate model representations of vocabulary tokens, as computed in
-        the dataset's examples, to the corresponding token rows in the embedding and unembedding matrices.
+        the dataset's examples, to the corresponding token rows in the embedding and lm_head matrices.
 
         Args:
             model (PreTrainedModel):
@@ -479,14 +481,14 @@ class ProcrustesRepresentationTranslators(RepresentationTranslators):
 
     def to_lm_head(self, representations: torch.Tensor, layer_index: int = None, **kwargs) -> torch.Tensor:
         """
-        Transforms the given representations to the unembedding space.
+        Transforms the given representations to the lm_head space.
 
         Args:
             representations (torch.Tensor): The intermediate representations to transform.
             layer_index (int): The index of the model layer the representations were extracted from.
 
         Returns:
-            torch.Tensor: The transformed representations in unembedding space.
+            torch.Tensor: The transformed representations in lm_head space.
         """
         if self.lm_head_maps is None \
                 or ((layer_index is None and "all" not in self.lm_head_maps)
@@ -505,7 +507,7 @@ class ProcrustesRepresentationTranslators(RepresentationTranslators):
 
 class MLPRepresentationTranslators(LinearRepresentationTranslators):
     """
-    Transforms intermediate model representations to the embedding and unembedding spaces
+    Transforms intermediate model representations to the embedding and lm_head spaces
     using MLPs.
     """
 
@@ -530,9 +532,9 @@ class MLPRepresentationTranslators(LinearRepresentationTranslators):
             space_prefixed_only: bool = False,
     ) -> None:
         """
-        Learns transformations that map representations from every layer to the embedding/unembedding spaces,
+        Learns transformations that map representations from every layer to the embedding/lm_head spaces,
         by fitting a transformation from intermediate model representations of single tokens from the vocabulary,
-        as extracted using the given prompt, to the respective rows in the embedding and unembedding matrices.
+        as extracted using the given prompt, to the respective rows in the embedding and lm_head matrices.
 
         Args:
             model (PreTrainedModel):
@@ -570,7 +572,7 @@ class MLPRepresentationTranslators(LinearRepresentationTranslators):
 
         n_layers = model.config.num_hidden_layers
         layer_batch_size = n_layers if layer_batch_size is None else layer_batch_size
-        for start_layer_i in tqdm(range(1, n_layers+1, layer_batch_size), desc="Fitting maps to embedding and unembedding spaces", unit="Layer batch"):
+        for start_layer_i in tqdm(range(1, n_layers+1, layer_batch_size), desc="Fitting maps to embedding and lm_head spaces", unit="Layer batch"):
             layers_to_learn = None if layer_batch_size is None else \
                 list(range(start_layer_i, min(start_layer_i + layer_batch_size, n_layers+1)))
             all_hidden_states = extract_vocab_hidden_states(model, tokenizer, token_ids, prompt, prompt_target, batch_size, layers_to_learn)
@@ -590,9 +592,9 @@ class MLPRepresentationTranslators(LinearRepresentationTranslators):
             dataset: Union[List[str], Dataset, IterableDataset, "datasets.Dataset"],
     ) -> None:
         """
-        Learns transformations that map representations from every layer to the embedding/unembedding spaces,
+        Learns transformations that map representations from every layer to the embedding/lm_head spaces,
         by fitting a transformation from intermediate model representations of vocabulary tokens, as computed in
-        the dataset's examples, to the corresponding token rows in the embedding and unembedding matrices.
+        the dataset's examples, to the corresponding token rows in the embedding and lm_head matrices.
 
         Args:
             model (PreTrainedModel):
