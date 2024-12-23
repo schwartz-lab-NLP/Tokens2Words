@@ -423,13 +423,15 @@ def prepare_new_words(
     if args.words_filter_min_freq is not None:
         new_words_from_data = [word for word in new_words_from_data if new_words_from_data_freqs[word] >= args.words_filter_min_freq]
 
-    topline_tokenizer = deepcopy(tokenizer)
-    topline_tokenizer_wo_normalize = deepcopy(tokenizer)
-    n_new_words = topline_tokenizer.add_tokens(new_words_from_data)
-    baseline_vocab_total_tokens = count_tokens_in_dataset(words_dataset, tokenizer, args.words_dataset_text_col)
-    max_vocab_total_tokens = count_tokens_in_dataset(words_dataset, topline_tokenizer, args.words_dataset_text_col)
-    logger.info(f"Baseline tokenizer - total tokens: {baseline_vocab_total_tokens}")
-    logger.info(f"Topline expanded tokenizer - total tokens: {max_vocab_total_tokens} - new words: {n_new_words}")
+    if args.words_dataset:
+        # Estimate new tokens rates
+        topline_tokenizer = deepcopy(tokenizer)
+        n_new_words = topline_tokenizer.add_tokens(new_words_from_data)
+        baseline_vocab_total_tokens = count_tokens_in_dataset(words_dataset, tokenizer, args.words_dataset_text_col)
+        max_vocab_total_tokens = count_tokens_in_dataset(words_dataset, topline_tokenizer, args.words_dataset_text_col)
+        logger.info(f"Baseline tokenizer - total tokens: {baseline_vocab_total_tokens}")
+        logger.info(f"Topline expanded tokenizer - total tokens: {max_vocab_total_tokens} - new words: {n_new_words}")
+
     new_words += new_words_from_data
     baseline_tokenization = {w: tokenizer.encode(w, add_special_tokens=False, return_tensors="pt")[0]
                              for w in new_words}
