@@ -30,7 +30,6 @@ from .utils.file_utils import parse_string_list_from_file
 from .utils.data_utils import load_lm_dataset, extract_new_words_from_dataset, get_group_texts_func, get_tokenize_func
 from .utils.eval_utils import get_last_zero_in_every_seq_mask, get_first_zero_in_every_seq_mask, compute_topk_token_rank
 from .utils.eval_utils import count_tokens_in_dataset
-from .utils.early_exit_utils import get_early_exit_forward
 
 import logging
 
@@ -523,11 +522,6 @@ def main(args):
     accelerator = Accelerator(mixed_precision=mixed_precision)
     model = AutoModelForCausalLM.from_pretrained(args.model_name, torch_dtype=torch.bfloat16 if mixed_precision == "bf16" else torch.float16)
 
-    if args.early_exit_layer is not None:
-        model.model.forward = types.MethodType(
-            get_early_exit_forward(exit_layer=args.early_exit_layer), model.model
-        )
-        model.config.num_hidden_layers = args.early_exit_layer
     model = accelerator.prepare(model)
     logger.info("Running patchscopes on new words...")
     patchscopes_retriever, patchscopes_results = prepare_patchscopes_retriever(args, model, baseline_tokenizer)
@@ -554,7 +548,6 @@ def main(args):
         args.detokenization_max_valid_layer,
         add_to_core_vocab=args.add_new_words_to_core_vocab,
         add_space_before_lowercase_word=args.add_space_before_lowercase_words,
-        early_exit_layer=args.early_exit_layer,
     )
     model, tokenizer = vocab_modifier.add_words_to_vocab(new_words)
 
@@ -573,7 +566,7 @@ def main(args):
             patchscopes_results.to_parquet(
                 os.path.join(output_dir, "patchscopes_results.parquet"))
 
-    if args.calibrate_new_lm_head:
+    if args.calibrate_new_entries:
         logger.info("Calibrating new LM head entries...")
         calibration_dataset = load_lm_dataset(args.calibration_dataset, language=args.calibration_dataset_language)
         calibration_dataset = calibration_dataset[args.calibration_dataset_split]
@@ -639,19 +632,21 @@ def parse_args():
     parser.add_argument("--exp_name", type=str)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--model_name", type=str, default="meta-llama/Llama-3.1-8B")
+    parser.add_argument("--output_dir", type=str, default="./experiments/")
+
     parser.add_argument("--add_new_words_to_core_vocab", action="store_true", default=False)
     parser.add_argument("--add_space_before_lowercase_words", action="store_true", default=False)
     parser.add_argument("--detokenization_decision_rule", type=str, default="first_id_layer")
     parser.add_argument("--detokenization_decision_rule_E", type=str, default=None)
     parser.add_argument("--detokenization_max_valid_layer", type=int, default=None)
-    parser.add_argument("--early_exit_layer", type=int, default=None)
+    parser.add_argument("--extraction_batch_size", type=int, default=128)
     parser.add_argument("--extraction_prompt", type=str, default="X")
     parser.add_argument("--patchscopes_prompt", type=str, default="X, X, X, X,")
     parser.add_argument("--prompt_target", type=str, default="X")
     parser.add_argument("--patchscopes_results_cache", type=str, default=None)
     parser.add_argument("--patchscopes_generate_n_tokens", type=int, default=20)
     parser.add_argument("--patchscopes_max_words", type=int, default=None)
-    parser.add_argument("--extraction_batch_size", type=int, default=128)
+
     parser.add_argument("--translators_path", type=str, default=None)
     parser.add_argument("--translators_fit_intercept", action="store_true", default=False)
     parser.add_argument("--translators_do_residual", action="store_true", default=False)
@@ -661,7 +656,8 @@ def parse_args():
     parser.add_argument("--translators_procrustes_layers", nargs="+", type=int, default=None)
     parser.add_argument("--translators_learn_on_space_prefixed_words_only", action="store_true", default=False)
     parser.add_argument("--translators_fit_min_word_len", type=int, default=None)
-    parser.add_argument("--calibrate_new_lm_head", action="store_true", default=False)
+
+    parser.add_argument("--calibrate_new_entries", action="store_true", default=False)
     parser.add_argument("--calibration_save_dir", type=str, default=None)
     parser.add_argument("--calibration_dataset", type=str, default=None)
     parser.add_argument("--calibration_dataset_split", type=str, default=None)
@@ -675,6 +671,7 @@ def parse_args():
     parser.add_argument("--calibration_n_warmup_steps", type=float, default=0.03)
     parser.add_argument("--calibration_num_epochs", type=int, default=1)
     parser.add_argument("--calibration_max_samples", type=int, default=None)
+
     parser.add_argument("--eval_dataset", type=str, default="wikitext")
     parser.add_argument("--eval_dataset_language", type=str, default=None)
     parser.add_argument("--eval_max_samples", type=int, default=None)
@@ -682,6 +679,7 @@ def parse_args():
     parser.add_argument("--eval_max_length", type=int, default=256)
     parser.add_argument("--eval_dataset_split", type=str, default="test")
     parser.add_argument("--eval_dataset_text_col", type=str, default="text")
+
     parser.add_argument("--words_dataset", type=str, default=None)
     parser.add_argument("--words_dataset_language", type=str, default=None)
     parser.add_argument("--words_dataset_split", type=str, default="test")
@@ -693,7 +691,6 @@ def parse_args():
     parser.add_argument("--words_filter_max_n_tokens", type=int, default=5)
     parser.add_argument("--words_filter_non_en", action="store_true", default=False)
     parser.add_argument("--words_filter_numeric", action="store_true", default=False)
-    parser.add_argument("--output_dir", type=str, default="./experiments/")
 
     args = parser.parse_args()
 
