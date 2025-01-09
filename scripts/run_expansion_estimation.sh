@@ -29,15 +29,16 @@ calibration_lr="0.0001"
 calibration_num_epochs=1
 calibration_num_samples=10000
 
+# for patchscopes:
 detokenization_decision_rule="1st_id_layer"
 detokenization_decision_rule_E="1st_id_layer"
 detokenization_max_valid_layer="18"
 
+# for heuristic detokenization, without patchscopes:
 #detokenization_layer="7"
 #detokenization_layer_embedding="7"
 
 translators_name="procrustes_v2_rms_all_layers_extract_x"
-
 
 patchscopes_prompt="בעברית: X X X X"
 patchscopes_cache="${output_dir}/patchscopes/${dataset}/${data_language}/prompt_beivrit_x_x_x_x.parquet"
@@ -63,6 +64,7 @@ words_list="ŒTokens2Words/word_lists/top_5k_hebrew_words_without_nikud.txt"
 
 python -m tokens2words.run_new_vocab_success_estimate \
   --output_dir "${output_dir}" --words_list "${words_list}" \
+  --translators_use_procrustes --translators_procrustes_normalize \
   --calibrate_new_entries --calibration_save_dir "${calibrators_path}" --calibration_lr "${calibration_lr}" \
   --calibration_dataset "${calibration_dataset}" --calibration_dataset_split "${calibration_split}" \
   --calibration_dataset_language "${data_language}" --calibration_num_epochs "${calibration_num_epochs}" \
@@ -83,10 +85,10 @@ python -m tokens2words.run_new_vocab_success_estimate \
 
 
 
-# without patchscopes:
-
+## without patchscopes:
 #python -m tokens2words.run_new_vocab_success_estimate \
 #  --output_dir "${output_dir}" --words_list "${words_list}" --max_words 500 \
+#  --translators_use_procrustes --translators_procrustes_normalize \
 #  --calibrate_new_entries --calibration_save_dir "${calibrators_path}" --calibration_lr "${calibration_lr}" \
 #  --calibration_dataset "${calibration_dataset}" --calibration_dataset_split "${calibration_split}" \
 #  --calibration_dataset_language "${data_language}" --calibration_num_epochs "${calibration_num_epochs}" \
