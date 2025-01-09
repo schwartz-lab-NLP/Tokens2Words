@@ -34,7 +34,12 @@ def extract_token_i_hidden_states(
     with torch.no_grad():
         for i in tqdm(range(0, len(inputs), batch_size), desc="Extracting hidden states", unit="batch", disable=not verbose):
             input_ids = tokenizer(inputs[i:i+batch_size], return_tensors="pt", return_attention_mask=False)['input_ids']
-            outputs = model(input_ids.to(device), output_hidden_states=True)
+            try:
+                outputs = model(input_ids.to(device), output_hidden_states=True)
+            except:
+                import pdb; pdb.set_trace()
+                # from transformers import AutoModelForCausalLM
+                # model2 = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B", torch_dtype=torch.bfloat16).to(device)
             for input_i in range(len(input_ids)):
                 for layer in layers_to_extract:
                     hidden_states = outputs.hidden_states[layer]
@@ -76,7 +81,7 @@ def extract_vocab_hidden_states(
             prompts = [prompt.replace(prompt_target, target) for target in tokens_to_extract[i:i+batch_size]]
             input_ids = tokenizer(prompts, return_tensors="pt", padding=True, padding_side="left")["input_ids"]
             # input_ids = tokenizer(prompts, return_tensors="pt")["input_ids"]
-            outputs = model.encoder(input_ids.to(device), output_hidden_states=True)
+            outputs = model(input_ids.to(device), output_hidden_states=True)
             for layer in layers_to_extract:
                 hidden_states = outputs.hidden_states[layer]
                 all_hidden_states[layer].append(hidden_states[:, -1, :].detach().cpu())

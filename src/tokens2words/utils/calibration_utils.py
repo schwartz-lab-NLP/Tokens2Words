@@ -54,7 +54,7 @@ class CalibrationModel(nn.Module):
         self.calibrate_lm_head = calibrate_lm_head
         self.calibrate_embedding = calibrate_embedding
         if not empty_init:
-            self.lm_Head_calibrator = EmbeddingCalibrator(base_model.config.hidden_size, lora_r, lora_alpha)
+            self.lm_head_calibrator = EmbeddingCalibrator(base_model.config.hidden_size, lora_r, lora_alpha)
             self.embedding_calibrator = EmbeddingCalibrator(base_model.config.hidden_size, lora_r, lora_alpha)
 
         self.loss_fct = nn.CrossEntropyLoss(reduction="none")
@@ -83,7 +83,7 @@ class CalibrationModel(nn.Module):
             with torch.no_grad():
                 lm_head_weights = self.lm_head.weight
                 normed_weights = lm_head_weights.clone()
-            normed_weights[self.new_tokens_start:self.new_tokens_end] = self.lm_Head_calibrator(lm_head_weights[self.new_tokens_start:self.new_tokens_end])
+            normed_weights[self.new_tokens_start:self.new_tokens_end] = self.lm_head_calibrator(lm_head_weights[self.new_tokens_start:self.new_tokens_end])
             logits = torch.matmul(outputs['last_hidden_state'], normed_weights.T)
         else:
             if self.calibrate_embedding:
@@ -109,24 +109,24 @@ class CalibrationModel(nn.Module):
 
     def get_calibrators(self):
         embedding_calibrator = self.embedding_calibrator if self.calibrate_embedding else None
-        lm_Head_calibrator = self.lm_Head_calibrator if self.calibrate_lm_head else None
+        lm_head_calibrator = self.lm_head_calibrator if self.calibrate_lm_head else None
         return {
             "embedding_calibrator": embedding_calibrator,
-            "lm_head_calibrator": lm_Head_calibrator,
+            "lm_head_calibrator": lm_head_calibrator,
             "new_tokens_start": self.new_tokens_start,
             "new_tokens_end": self.new_tokens_end,
         }
 
-    def set_calibrators(self, embedding_calibrator=None, lm_head_calibrator=Nonee):
+    def set_calibrators(self, embedding_calibrator=None, lm_head_calibrator=None):
         self.embedding_calibrator = embedding_calibrator
-        self.lm_Head_calibrator = lm_head_calibrator
+        self.lm_head_calibrator = lm_head_calibrator
         
     def save_calibrators(self, save_dir):
         os.makedirs(save_dir, exist_ok=True)
         if self.calibrate_embedding:
             torch.save(self.embedding_calibrator, os.path.join(save_dir, "embedding_calibrator.pt"))
         if self.calibrate_lm_head:
-            torch.save(self.lm_Head_calibrator, os.path.join(save_dir, "lm_Head_calibrator.pt"))
+            torch.save(self.lm_head_calibrator, os.path.join(save_dir, "lm_head_calibrator.pt"))
 
     def load_calibrators(self, load_dir, fail_ok=False):
         """Loads the model's state dictionary from a file."""
@@ -134,7 +134,7 @@ class CalibrationModel(nn.Module):
             if self.calibrate_embedding:
                 self.embedding_calibrator = torch.load(os.path.join(load_dir, "embedding_calibrator.pt"))
             if self.calibrate_lm_head:
-                self.lm_Head_calibrator = torch.load(os.path.join(load_dir, "lm_Head_calibrator.pt"))
+                self.lm_head_calibrator = torch.load(os.path.join(load_dir, "lm_head_calibrator.pt"))
             return True
         except:
             if fail_ok:
@@ -151,7 +151,7 @@ def get_calibration_model(model, original_vocab_size, num_new_tokens, target_los
         param.requires_grad = False
     for param in calibrated_model.lm_head.parameters():
         param.requires_grad = False
-    for param in calibrated_model.lm_Head_calibrator.parameters():
+    for param in calibrated_model.lm_head_calibrator.parameters():
         param.requires_grad = True
     for param in calibrated_model.embedding_calibrator.parameters():
         param.requires_grad = True
@@ -159,8 +159,8 @@ def get_calibration_model(model, original_vocab_size, num_new_tokens, target_los
     return calibrated_model
 
 
-def train_calibration_model(calibrated_model: CalibrationModel, tokenizer, dataset, save_dir=None, max_samples=None, filter_examples_without_new_tokens=True, lr=1e-4, lr_schedule="linear", num_epochs=1, batch_size=8, max_length=256, n_warmup_steps=0, text_col_name="text", clip_grad_norm=1.0):
-    accelerator = Accelerator()
+def train_calibration_model(calibrated_model: CalibrationModel, tokenizer, dataset, save_dir=None, max_samples=None, filter_examples_without_new_tokens=True, lr=1e-4, lr_schedule="linear", num_epochs=1, batch_size=8, max_length=256, n_warmup_steps=0, text_col_name="text", clip_grad_norm=1.0, mixed_precision=None):
+    accelerator = Accelerator(mixed_precision=mixed_precision)
     # Optimizer
     optimizer = optim.AdamW(calibrated_model.parameters(), lr=lr)
 
@@ -254,6 +254,8 @@ def train_calibration_model(calibrated_model: CalibrationModel, tokenizer, datas
 
 
 def merge_calibrators_to_hf_model(hf_model, new_tokens_start, new_tokens_end=None, embedding_calibrator=None, lm_head_calibrator=None):
+    embedding_calibrator.to(hf_model.device)
+    lm_head_calibrator.to(hf_model.device)
     if embedding_calibrator is not None:
         embedding_weights = hf_model.get_input_embeddings().weight
         with torch.no_grad():
@@ -264,18 +266,17 @@ def merge_calibrators_to_hf_model(hf_model, new_tokens_start, new_tokens_end=Non
     if lm_head_calibrator is not None:
         lm_head_weights = hf_model.get_output_embeddings().weight
         with torch.no_grad():
-            calibrated_weights = lm_Head_calibrator(lm_head_weights[new_tokens_start:new_tokens_end])
+            calibrated_weights = lm_head_calibrator(lm_head_weights[new_tokens_start:new_tokens_end])
             hf_model.lm_head.weight.data[new_tokens_start:new_tokens_end] = calibrated_weights
 
     return hf_model
 
 
 def merge_calibration_model_to_hf_model(hf_model, calibrated_model):
-    accelerator = Accelerator()
-    calibrated_model, hf_model = accelerator.prepare(calibrated_model, hf_model)
+    calibrated_model.to(hf_model.device)
     if calibrated_model.calibrate_lm_head:
         lm_head_weights = calibrated_model.lm_head.weight
-        normed_weights = calibrated_model.lm_Head_calibrator(lm_head_weights[calibrated_model.new_tokens_start:calibrated_model.new_tokens_end])
+        normed_weights = calibrated_model.lm_head_calibrator(lm_head_weights[calibrated_model.new_tokens_start:calibrated_model.new_tokens_end])
         with torch.no_grad():
             hf_model.lm_head.weight.data[calibrated_model.new_tokens_start:calibrated_model.new_tokens_end] = normed_weights
     if calibrated_model.calibrate_embedding:

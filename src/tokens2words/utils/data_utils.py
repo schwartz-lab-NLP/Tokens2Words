@@ -3,6 +3,7 @@ from datasets import load_dataset, Dataset, DatasetDict
 from itertools import chain
 from tqdm import tqdm
 from collections import Counter
+from accelerate import Accelerator
 
 LANGUAGES_TO_DECODE_FROM_BYTES = ["he", "fr", "uk"]
 STREAMING_DATASETS = ["fineweb-edu"]
@@ -147,42 +148,11 @@ def extract_new_words_from_dataset(
     return new_words, new_words_freq
 
 
-# def get_words_in_dataset_by_token_length(data, tokenizer, remove_breaks=False, filter_func=lambda: True):
-#     # dict to map from tokens length (2, 3, 4...) to multi-token words in that length found in the data
-#     num_tokens2multi_token_words = defaultdict(list)
-#
-#     # custom_punctuation = string.punctuation + "“”"
-#     #
-#     # def remove_possessive_s(s):
-#     #     return s[:-2] if (s.endswith("'s") or s.endswith("’s")) else s
-#
-#     # Iterate over the dataset
-#     for example in data:
-#         text = example["text"]
-#         if remove_breaks:
-#             text.replace("--", " ")
-#
-#         words = re.findall(r'\b\w+\b', text)
-#         # words = text.split()
-#
-#         for word in words:
-#             # word = word.strip(custom_punctuation)
-#             # word = remove_possessive_s(word)
-#             tokens = tokenizer.tokenize(word)
-#             token_count = len(tokens)
-#             if (token_count > 1) and (not tokenizer.vocab.get(word, False)) and filter_func(word, token_count):
-#                 num_tokens2multi_token_words[token_count].append(word)
-#
-#     # Remove duplicates in the lists, but keep insertion order
-#     for k in num_tokens2multi_token_words:
-#         num_tokens2multi_token_words[k] = list(dict.fromkeys(num_tokens2multi_token_words[k]))
-#
-#     return num_tokens2multi_token_words
-
 def get_group_texts_func(block_size=1024):
     def group_texts(examples):
         # Concatenate all texts.
         concatenated_examples = {k: list(chain(*examples[k])) for k in examples.keys()}
+
         total_length = len(concatenated_examples[list(examples.keys())[0]])
         # We drop the small remainder, and if the total_length < block_size  we exclude this batch and return an empty dict.
         # We could add padding if the model supported it instead of this drop, you can customize this part to your needs.
@@ -206,3 +176,39 @@ def get_tokenize_func(tokenizer, text_col_name):
         )
         return output
     return _tokenize
+
+
+def tokenize_and_prepare_dataset(
+        dataset, tokenizer, accelerator=None,
+        text_col_name: str = "text",
+        max_length: int = 256,
+        eval_max_samples: int = None,
+):
+
+    if tokenizer.bos_token is not None and max_length:
+        # leave room for <BOS> token to be added:
+        max_tokenized_len = max_length - 1
+    else:
+        max_tokenized_len = max_length
+
+    tokenize_function = get_tokenize_func(tokenizer, text_col_name)
+
+    column_names = dataset.column_names
+
+    tokenized_dataset = dataset.map(
+        tokenize_function,
+        batched=True,
+        remove_columns=column_names,
+        load_from_cache_file=False,
+        desc="Running tokenizer on dataset",
+    )
+    group_texts = get_group_texts_func(block_size=max_tokenized_len)
+    lm_dataset = tokenized_dataset.map(
+        group_texts,
+        batched=True,
+    )
+
+    if eval_max_samples:
+        lm_dataset = lm_dataset.select(range(eval_max_samples))
+
+    return lm_dataset
