@@ -1,4 +1,4 @@
-# Detokenization Analysis Using PatchScopes and Logit Lens
+# Detokenization Analysis and Vocabulary Expansion Using PatchScopes and Logit Lens
 
 This repository contains the implementation of a research project based on the paper: [From Tokens to Words: On the Inner Lexicon of LLMs
 ](https://arxiv.org/abs/2410.05864). The project focuses on analyzing the detokenization process and leveraging the inner representation of language models to expand a tokenizer's vocabulary effectively.
