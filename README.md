@@ -120,9 +120,3 @@ If you use this repository in your work, please cite:
 This project is licensed under the MIT License. See the `LICENSE` file for details.
 
 ---
-
-## Acknowledgements
-
-Special thanks to the authors of the referenced paper and the open-source contributors whose tools were used in this project.
-
----
