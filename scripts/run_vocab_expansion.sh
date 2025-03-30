@@ -6,8 +6,7 @@ cd Tokens2Words/src/
 model="Llama-2-7b-hf"
 model_name="meta-llama/${model}"
 output_dir="Tokens2Words/runs/vocab_expansion/${model}"
-output_dir="/cs/snapless/roys/yuval.reif/Tokens2Words/runs/vocab_expansion/debug/${model}/"
-
+Œ
 #dataset="wikitext"
 #data_split="test"
 #data_language="en"
