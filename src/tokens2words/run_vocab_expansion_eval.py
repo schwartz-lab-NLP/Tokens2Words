@@ -94,9 +94,10 @@ def eval_lm(
     logger.info(f"Baseline tokenizer - total tokens: {baseline_vocab_total_tokens}")
     logger.info(f"Expanded tokenizer - total tokens: {new_vocab_total_tokens}")
 
-    if eval_max_samples:
+    if eval_max_samples and eval_max_samples < len(lm_dataset):
         lm_dataset = lm_dataset.select(range(eval_max_samples))
-        baseline_lm_dataset = baseline_lm_dataset.select(range(eval_max_samples))
+        if eval_max_samples < len(baseline_lm_dataset):
+            baseline_lm_dataset = baseline_lm_dataset.select(range(eval_max_samples))
 
     data_collator = default_data_collator
 
@@ -428,7 +429,7 @@ def prepare_new_words(
         baseline_vocab_total_tokens = count_tokens_in_dataset(words_dataset, tokenizer, args.words_dataset_text_col)
         max_vocab_total_tokens = count_tokens_in_dataset(words_dataset, topline_tokenizer, args.words_dataset_text_col)
         logger.info(f"Baseline tokenizer - total tokens: {baseline_vocab_total_tokens}")
-        logger.infoo(f"Topline expanded tokenizer - total tokens: {max_vocab_total_tokens} - new words: {n_new_words}")
+        logger.info(f"Topline expanded tokenizer - total tokens: {max_vocab_total_tokens} - new words: {n_new_words}")
 
     new_words += new_words_from_data
     baseline_tokenization = {w: tokenizer.encode(w, add_special_tokens=False, return_tensors="pt")[0]
@@ -460,7 +461,7 @@ def prepare_translators(args, model, tokenizer):
     save_translators = True
     if args.translators_path:
         try:
-            translators = torch.load(args.translators_path, map_location=torch.device('cpu'))
+            translators = torch.load(args.translators_path, map_location=torch.device('cpu'), weights_only=False)
             save_translators = False
             return translators, save_translators
         except:

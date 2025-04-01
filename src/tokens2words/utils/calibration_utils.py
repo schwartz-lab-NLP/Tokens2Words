@@ -132,9 +132,9 @@ class CalibrationModel(nn.Module):
         """Loads the model's state dictionary from a file."""
         try:
             if self.calibrate_embedding:
-                self.embedding_calibrator = torch.load(os.path.join(load_dir, "embedding_calibrator.pt"))
+                self.embedding_calibrator = torch.load(os.path.join(load_dir, "embedding_calibrator.pt"), weights_only=False)
             if self.calibrate_lm_head:
-                self.lm_head_calibrator = torch.load(os.path.join(load_dir, "lm_head_calibrator.pt"))
+                self.lm_head_calibrator = torch.load(os.path.join(load_dir, "lm_head_calibrator.pt"), weights_only=False)
             return True
         except:
             if fail_ok:
@@ -202,7 +202,7 @@ def train_calibration_model(calibrated_model: CalibrationModel, tokenizer, datas
         examples_w_new_token = np.arange(len(lm_dataset))[np.any(np.array(lm_dataset['input_ids']) >= calibrated_model.new_tokens_start, axis=1)]
         lm_dataset = lm_dataset.select(examples_w_new_token)
 
-    if max_samples is not None:
+    if max_samples is not None and max_samples < len(lm_dataset):
         lm_dataset = lm_dataset.select(np.arange(max_samples))
 
     data_collator = default_data_collator
