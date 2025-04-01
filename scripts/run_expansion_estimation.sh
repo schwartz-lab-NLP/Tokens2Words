@@ -49,7 +49,6 @@ calibrators_path="${output_dir}/${exp_name}/calibrators/"
 
 python -m tokens2words.run_new_vocab_success_estimate \
   --output_dir "${output_dir}" --words_list "${words_list}" \
-  --translators_use_procrustes --translators_procrustes_normalize \
   --calibrate_new_entries --calibration_save_dir "${calibrators_path}" --calibration_lr "${calibration_lr}" \
   --calibration_dataset "${calibration_dataset}" --calibration_dataset_split "${calibration_split}" \
   --calibration_dataset_language "${data_language}" --calibration_num_epochs "${calibration_num_epochs}" \

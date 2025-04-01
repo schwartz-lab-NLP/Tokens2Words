@@ -71,5 +71,5 @@ python -m tokens2words.run_vocab_expansion_eval \
     --extraction_batch_size 32  --eval_batch_size 4 --calibration_batch_size 4 \
     --eval_dataset "${dataset}" --eval_dataset_split "${data_split}" \
     --eval_max_length "${max_length}" --eval_max_samples 10000 \
-    --translators_path "${translators_path}" \
+    --translators_path "${translators_path}" --translators_use_procrustes --translators_procrustes_normalize  \
     --patchscopes_results_cache "${patchscopes_cache}"
