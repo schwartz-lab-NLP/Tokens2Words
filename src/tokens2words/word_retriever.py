@@ -28,6 +28,7 @@ class PatchscopesRetriever(WordRetrieverBase):
             prompt_target_placeholder: str = "{word}",
             representation_token_idx_to_extract: int = -1,
             num_tokens_to_generate: int = 10,
+            batch_size: int = 8,
     ):
         super().__init__(model, tokenizer)
         self.prompt_input_ids, self.prompt_target_idx = \
@@ -36,6 +37,7 @@ class PatchscopesRetriever(WordRetrieverBase):
             self._build_representation_prompt_func(representation_prompt, prompt_target_placeholder)
         self.representation_token_idx = representation_token_idx_to_extract
         self.num_tokens_to_generate = num_tokens_to_generate
+        self.batch_size = batch_size
 
     def _build_prompt_input_ids_template(self, prompt, target_placeholder):
         prompt_input_ids = [self.tokenizer.bos_token_id] if self.tokenizer.bos_token_id is not None else []
@@ -107,6 +109,40 @@ class PatchscopesRetriever(WordRetrieverBase):
 
         return patchscopes_description_by_layers, last_token_hidden_states
 
+    def extract_hidden_states_batch(self, words):
+        """Extract hidden states for multiple words in batches"""
+        all_hidden_states = []
+
+        for i in range(0, len(words), self.batch_size):
+            batch_words = words[i:i + self.batch_size]
+            batch_inputs = [self._prepare_representation_prompt(word) for word in batch_words]
+
+            # Process the batch together
+            batch_hidden_states = extract_token_i_hidden_states(
+                self.model,
+                self.tokenizer,
+                batch_inputs,
+                token_idx_to_extract=self.representation_token_idx,
+                return_dict=False,
+                verbose=False
+            )
+
+            all_hidden_states.extend(batch_hidden_states)
+
+        return torch.stack(all_hidden_states)
+
+    def get_hidden_states_and_retrieve_words_batch(self, words, num_tokens_to_generate=None):
+        """Process multiple words in batches and return their hidden states and patchscopes descriptions"""
+        last_token_hidden_states = self.extract_hidden_states_batch(words)
+        patchscopes_descriptions = self.retrieve_word(
+            last_token_hidden_states, num_tokens_to_generate=num_tokens_to_generate)
+
+        # Organize results by word
+        results = {}
+        for word, description in zip(words, patchscopes_descriptions):
+            results[word] = (description, last_token_hidden_states[words.index(word)])
+
+        return results
 
 class ReverseLogitLensRetriever(WordRetrieverBase):
     def __init__(self, model, tokenizer, device='cuda', dtype=torch.float16):
