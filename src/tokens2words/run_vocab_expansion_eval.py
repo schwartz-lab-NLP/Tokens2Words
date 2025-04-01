@@ -24,7 +24,7 @@ from copy import deepcopy
 import types
 
 from .word_retriever import PatchscopesRetriever
-from .representation_translator import LinearRepresentationTranslators, ProcrustesRepresentationTranslators, MLPRepresentationTranslators
+from .representation_translator import LinearRepresentationTranslators, ProcrustesRepresentationTranslators, LinearRegressionRepresentationTranslators, MLPRepresentationTranslators, RMSRepresentationTranslators
 from .vocab_modifier import DetokenizationVocabularyExpander
 from .utils.file_utils import parse_string_list_from_file
 from .utils.data_utils import load_lm_dataset, extract_new_words_from_dataset, get_group_texts_func, get_tokenize_func
@@ -94,10 +94,9 @@ def eval_lm(
     logger.info(f"Baseline tokenizer - total tokens: {baseline_vocab_total_tokens}")
     logger.info(f"Expanded tokenizer - total tokens: {new_vocab_total_tokens}")
 
-    if eval_max_samples and eval_max_samples < len(lm_dataset):
+    if eval_max_samples:
         lm_dataset = lm_dataset.select(range(eval_max_samples))
-        if eval_max_samples < len(baseline_lm_dataset):
-            baseline_lm_dataset = baseline_lm_dataset.select(range(eval_max_samples))
+        baseline_lm_dataset = baseline_lm_dataset.select(range(eval_max_samples))
 
     data_collator = default_data_collator
 
@@ -195,8 +194,6 @@ def eval_lm(
                 target_results[f"top{top_k}_acc"] = ((topk == labels.unsqueeze(-1)).any(
                     dim=-1)[target_mask_bool]).detach().cpu().numpy()
                 if original_labels is not None:
-                    # target_results[f"original_top{top_k}_acc"] = ((topk == original_labels.unsqueeze(-1)).any(
-                    #     dim=-1)[target_mask_bool]).detach().cpu().numpy()
                     target_results[f"sum_top{top_k}_acc"] = (
                         ((topk == original_labels.unsqueeze(-1)) | (topk == labels.unsqueeze(-1))).any(
                         dim=-1)[target_mask_bool]).detach().cpu().numpy()
@@ -217,7 +214,6 @@ def eval_lm(
             target_results["mrr"] = ((1 / rank)[target_mask_bool]).detach().cpu().numpy()
             if original_labels is not None:
                 orig_rank = compute_topk_token_rank(logits, original_labels)
-                # target_results["original_mrr"] = ((1 / orig_rank)[target_mask_bool]).detach().cpu().numpy()
                 target_results["sum_mrr"] = ((1 / torch.minimum(orig_rank, rank))[target_mask_bool]).detach().cpu().numpy()
 
         overall_results["mrr"] = ((1 / rank)[overall_mask_bool]).detach().cpu().numpy()
@@ -384,7 +380,7 @@ def get_word_filter(args):
             is_valid = False
         if args.words_filter_non_en and not all('a' <= char <= 'z' or 'A' <= char <= 'Z' for char in word):
             is_valid = False
-        if args.words_filter_numeric and not word.isalpha():
+        if args.words_filter_numeric and any(char.isdigit() for char in word):
             is_valid = False
         return is_valid
 
@@ -432,6 +428,10 @@ def prepare_new_words(
         logger.info(f"Topline expanded tokenizer - total tokens: {max_vocab_total_tokens} - new words: {n_new_words}")
 
     new_words += new_words_from_data
+
+    if args.max_words is not None:
+        new_words = new_words[:args.max_words]
+
     baseline_tokenization = {w: tokenizer.encode(w, add_special_tokens=False, return_tensors="pt")[0]
                              for w in new_words}
 
@@ -459,9 +459,10 @@ def prepare_patchscopes_retriever(args, model, tokenizer):
 
 def prepare_translators(args, model, tokenizer):
     save_translators = True
+    translators = None
     if args.translators_path:
         try:
-            translators = torch.load(args.translators_path, map_location=torch.device('cpu'), weights_only=False)
+            translators = torch.load(args.translators_path, map_location=torch.device('cpu'))
             save_translators = False
             return translators, save_translators
         except:
@@ -475,7 +476,10 @@ def prepare_translators(args, model, tokenizer):
             prompt_target=args.prompt_target,
             translation_layers=args.translators_procrustes_layers,
             normalize=args.translators_procrustes_normalize,
+            normalize_embeddings=args.translators_procrustes_normalize_embeddings,
+            post_normalize_mode=args.translators_post_normalize_mode,
             batch_size=args.extraction_batch_size,
+            layer_batch_size=args.translators_layer_batch_size,
             space_prefixed_only=args.translators_learn_on_space_prefixed_words_only,
             min_word_len=args.translators_fit_min_word_len,
         )
@@ -487,18 +491,27 @@ def prepare_translators(args, model, tokenizer):
             prompt_target=args.prompt_target,
             batch_size=args.extraction_batch_size,
         )
-    else:
-        translators = LinearRepresentationTranslators(do_residual=args.translators_do_residual)
+    elif args.translators_learn_linear:
+        translators = LinearRegressionRepresentationTranslators()
         translators.fit_on_tokens(
             model, tokenizer,
             prompt=args.extraction_prompt,
             prompt_target=args.prompt_target,
+            translation_layers=args.translators_procrustes_layers,
+            normalize=args.translators_procrustes_normalize,
+            normalize_embeddings=args.translators_procrustes_normalize_embeddings,
+            post_normalize_mode=args.translators_post_normalize_mode,
             batch_size=args.extraction_batch_size,
-            fit_intercept=args.translators_fit_intercept,
+            layer_batch_size=args.translators_layer_batch_size,
             space_prefixed_only=args.translators_learn_on_space_prefixed_words_only,
             min_word_len=args.translators_fit_min_word_len,
         )
 
+    elif args.translators_use_rms:
+        translators = RMSRepresentationTranslators()
+
+    if translators is None:
+        save_translators = False
     return translators, save_translators
 
 
@@ -543,6 +556,7 @@ def main(args):
     vocab_modifier = DetokenizationVocabularyExpander(
         model, tokenizer,
         patchscopes_retriever, patchscopes_results,
+        args.patchscopes_force_starts_with_word,
         translators,
         args.detokenization_decision_rule,
         args.detokenization_decision_rule_E,
@@ -647,16 +661,22 @@ def parse_args():
     parser.add_argument("--patchscopes_results_cache", type=str, default=None)
     parser.add_argument("--patchscopes_generate_n_tokens", type=int, default=20)
     parser.add_argument("--patchscopes_max_words", type=int, default=None)
+    parser.add_argument("--patchscopes_force_starts_with_word", action="store_true", default=False)
 
     parser.add_argument("--translators_path", type=str, default=None)
     parser.add_argument("--translators_fit_intercept", action="store_true", default=False)
     parser.add_argument("--translators_do_residual", action="store_true", default=False)
     parser.add_argument("--translators_learn_mlp", action="store_true", default=False)
+    parser.add_argument("--translators_learn_linear", action="store_true", default=False)
     parser.add_argument("--translators_use_procrustes", action="store_true", default=False)
+    parser.add_argument("--translators_use_rms", action="store_true", default=False)
     parser.add_argument("--translators_procrustes_normalize", action="store_true", default=False)
+    parser.add_argument("--translators_procrustes_normalize_embeddings", action="store_true", default=False)
+    parser.add_argument("--translators_post_normalize_mode", type=str, default=None)
     parser.add_argument("--translators_procrustes_layers", nargs="+", type=int, default=None)
     parser.add_argument("--translators_learn_on_space_prefixed_words_only", action="store_true", default=False)
     parser.add_argument("--translators_fit_min_word_len", type=int, default=None)
+    parser.add_argument("--translators_layer_batch_size", type=int, default=2)
 
     parser.add_argument("--calibrate_new_entries", action="store_true", default=False)
     parser.add_argument("--calibration_save_dir", type=str, default=None)
@@ -691,7 +711,8 @@ def parse_args():
     parser.add_argument("--words_filter_min_freq", type=int, default=None)
     parser.add_argument("--words_filter_max_n_tokens", type=int, default=5)
     parser.add_argument("--words_filter_non_en", action="store_true", default=False)
-    parser.add_argument("--words_filter_numeric", action="store_true", default=False)
+    parser.add_argument("--words_filter_numeric", action="store_true", default=True)
+    parser.add_argument("--max_words", type=int, default=None)
 
     args = parser.parse_args()
 

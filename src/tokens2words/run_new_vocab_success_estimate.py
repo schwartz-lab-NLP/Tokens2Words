@@ -12,6 +12,7 @@ import pandas as pd
 import numpy as np
 from tabulate import tabulate
 from tqdm import tqdm
+import re
 import torch
 from torch import nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -37,10 +38,27 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 logger = logging.getLogger(__name__)
 
 
+def build_preprocess_word_func(args):
+    noisy_chars = re.compile(r"[^\w\s.,?!'\"؛،؛־-]+")
+    space_prefix = args.space_prefix
+
+    def preprocess_word(word):
+        if word.startswith(space_prefix):
+            word.replace(space_prefix, " ")
+        if args.preprocess_remove_noisy_chars:
+            word = re.sub(noisy_chars, "", word)
+        return word
+
+    return preprocess_word
+
+
 def prepare_new_words(
         args, tokenizer):
     
     new_words = parse_string_list_from_file(args.words_list, args.words_list_delimiter)
+    preprocess_word = build_preprocess_word_func(args)
+    new_words = [preprocess_word(w) for w in new_words]
+    new_words = list(dict.fromkeys(new_words))  # remove duplicates
     new_words = [w for w in new_words if not tokenizer.vocab.get(w, False)]
     if args.max_words is not None:
         new_words = new_words[:args.max_words]
@@ -99,7 +117,6 @@ def main(args):
             os.makedirs(output_dir, exist_ok=True)
             torch.save(translators, os.path.join(output_dir, f"translators.pt"))
 
-    # TODO allow to use either patchscopes or heuristic
     if args.use_patchscopes:
         logger.info("Running patchscopes on new words...")
         patchscopes_retriever, patchscopes_results = prepare_patchscopes_retriever(args, model, base_tokenizer)
@@ -107,6 +124,7 @@ def main(args):
         vocab_modifier = DetokenizationVocabularyExpander(
             model, tokenizer,
             patchscopes_retriever, patchscopes_results,
+            args.patchscopes_force_starts_with_word,
             translators,
             args.detokenization_decision_rule,
             args.detokenization_decision_rule_E,
@@ -273,16 +291,19 @@ def parse_args():
     parser.add_argument("--patchscopes_results_cache", type=str, default=None)
     parser.add_argument("--patchscopes_generate_n_tokens", type=int, default=20)
     parser.add_argument("--patchscopes_max_words", type=int, default=None)
+    parser.add_argument("--patchscopes_force_starts_with_word", action="store_true", default=False)
 
     parser.add_argument("--translators_path", type=str, default=None)
     parser.add_argument("--translators_fit_intercept", action="store_true", default=False)
     parser.add_argument("--translators_do_residual", action="store_true", default=False)
     parser.add_argument("--translators_learn_mlp", action="store_true", default=False)
+    parser.add_argument("--translators_learn_linear", action="store_true", default=False)
     parser.add_argument("--translators_use_procrustes", action="store_true", default=False)
     parser.add_argument("--translators_procrustes_normalize", action="store_true", default=False)
     parser.add_argument("--translators_procrustes_layers", nargs="+", type=int, default=None)
     parser.add_argument("--translators_learn_on_space_prefixed_words_only", action="store_true", default=False)
     parser.add_argument("--translators_fit_min_word_len", type=int, default=None)
+    parser.add_argument("--translators_layer_batch_size", type=int, default=2)
 
     parser.add_argument("--calibrate_new_entries", action="store_true", default=False)
     parser.add_argument("--calibration_save_dir", type=str, default=None)
@@ -310,11 +331,13 @@ def parse_args():
 
     parser.add_argument("--words_list", type=str, default=None)
     parser.add_argument("--words_list_delimiter", type=str, default=None)
+    parser.add_argument("--preprocess_remove_noisy_chars", action="store_true", default=True)
+    parser.add_argument("--space_prefix", type=str, default="Ġ")
     parser.add_argument("--max_words", type=int, default=None)
 
     args = parser.parse_args()
 
-    assert  args.words_list is not None, \
+    assert args.words_list is not None, \
         "Please pass the path to a file containing a list of words (--words_list)"
 
     return args

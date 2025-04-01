@@ -93,7 +93,6 @@ def filter_single_token_words(array, tokenizer, add_space_prefix_for_lower=True)
     return array[mask], token_counts
 
 
-# TODO make clearer what's its use
 def get_last_zero_in_every_seq_mask(tensor):
     # Find where consecutive zeros end
     zero_mask = (tensor == 0)
@@ -160,16 +159,16 @@ def compute_metrics(
         original_labels=None, original_logits=None,
         debug=False):
     target_results = dict()  # will hold metrics for all the new words we add or their original tokenization
-    background_results = dict()  # will hold metrics for all background tokens, i.e., not the ones we add or replace
+    background_results = dict()  # will hold metrics for all background tokens, i.e., not the ones we add or replace, or their subsequent tokens
     overall_results = dict()  # will hold metrics for all tokens
     successful_targets = None  # will hold list of target tokens successfully predicted
-    if compute_subsequent_metrics:
-        # prepare labels and attentions masks for computing metrics only for the 1st tokens following the new words
-        subsequent_labels = labels[:,  1:]
-        subsequent_attention_mask = get_last_zero_in_every_seq_mask(attention_mask[..., :-1].contiguous())
-        subsequent_attention_mask_bool = subsequent_attention_mask == 1
     attention_mask_bool = attention_mask == 1
     overall_mask_bool = attention_mask_bool
+    if compute_subsequent_metrics:
+        subsequent_labels = labels[:,  1:]
+        subsequent_attention_mask = get_last_zero_in_every_seq_mask(attention_mask)
+        subsequent_attention_mask_bool = subsequent_attention_mask == 1
+        subsequent_attention_mask_bool = subsequent_attention_mask_bool[..., :-1].contiguous()
 
     if compute_target_metrics:
         target_mask = get_first_zero_in_every_seq_mask(attention_mask)
@@ -183,17 +182,12 @@ def compute_metrics(
         ).mean().detach().cpu().numpy()
 
     top1 = logits.argmax(dim=-1)
-    if original_logits is not None:
-        orig_top1 = original_logits.argmax(dim=-1)
 
     if compute_target_metrics:
         target_results["top1_acc"] = ((labels == top1)[target_mask_bool]).detach().cpu().numpy()
         if original_labels is not None:
             target_results["sum_top1_acc"] = (
                 ((original_labels == top1) | (labels == top1))[target_mask_bool]).detach().cpu().numpy()
-            if original_logits is not None:
-                target_results["orig_top1_acc"] = (
-                    (original_labels == orig_top1)[target_mask_bool]).detach().cpu().numpy()
 
         if return_successful_targets:
             successful_targets = (labels[(labels == top1) & target_mask_bool]).detach().cpu().numpy()
@@ -202,20 +196,14 @@ def compute_metrics(
                          labels == top1)[attention_mask_bool]).detach().cpu().numpy()
     if compute_subsequent_metrics:
         background_results["subsequent_top1_acc"] = ((subsequent_labels == top1[:, 1:])[subsequent_attention_mask_bool]).detach().cpu().numpy()
-    if original_logits is not None:
-        background_results["orig_top1_acc"] = (
-            (original_labels == orig_top1)[attention_mask_bool]).detach().cpu().numpy()
-        if compute_subsequent_metrics:
-            background_results["orig_subsequent_top1_acc"] = (
-            (subsequent_labels == orig_top1[:, 1:])[subsequent_attention_mask_bool]).detach().cpu().numpy()
+        if original_labels is not None:
+            background_results["sum_subsequent_top1_acc"] = (
+                ((original_labels[:,  1:] == top1[:, 1:]) | (subsequent_labels == top1[:, 1:]))[subsequent_attention_mask_bool]).detach().cpu().numpy()
 
     overall_results["top1_acc"] = ((labels == top1))[overall_mask_bool].detach().cpu().numpy()
     if original_labels is not None:
         overall_results["sum_top1_acc"] = (
             ((original_labels == top1) | (labels == top1)))[overall_mask_bool].detach().cpu().numpy()
-        if original_logits is not None:
-            overall_results["orig_top1_acc"] = (
-                (original_labels == orig_top1)[overall_mask_bool]).detach().cpu().numpy()
 
     if debug:
         import pdb; pdb.set_trace()
@@ -323,8 +311,11 @@ def eval_next_word_prediction(
     if reduction == 'mean':
         reduce_func = lambda x: np.mean(_concat_func(x)).item()
 
+    target_metrics["count"] = None
     for metric_name, metric_value in target_metrics.items():
         target_metrics[metric_name] = reduce_func(metric_value)
+        if target_metrics["count"] is None:
+            target_metrics["count"] = len(_concat_func(metric_value))
     for metric_name, metric_value in background_metrics.items():
         background_metrics[metric_name] = reduce_func(metric_value)
     for metric_name, metric_value in overall_metrics.items():

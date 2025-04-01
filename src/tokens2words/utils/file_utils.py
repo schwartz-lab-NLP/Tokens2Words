@@ -65,30 +65,34 @@ def merge_dfs(base_dir, exp_name, part_format="part_{i}_", output_dir=None,
     return merged_df, dataframes
 
 
+def save_string_list_to_file(strings, filepath, delimiter="\n"):
+    with open(filepath, "w") as file:
+        file.write(delimiter.join(strings))
+
+
 def parse_string_list_from_file(file_path, delimiter=None):
     """
-    Parses a list of strings from a file, handling various list formats.
+    Parses a list of strings from a file, handling various list formats efficiently.
 
     Args:
         file_path (str): Path to the file containing the list.
+        delimiter (str or None): Delimiter to split the strings. Use "newline" for line-based splitting.
 
     Returns:
         list: A list of parsed strings.
     """
+    results = []
+
     with open(file_path, 'r') as file:
-        content = file.read()
+        if delimiter is None:
+            # Process line by line, stripping brackets, quotes, and unnecessary characters
+            for line in file:
+                line = line.strip("[]{}()\"'\n ").replace("\n", " ")
+                results.extend(line.split())  # Split by whitespace
+        else:
+            delimiter = "\n" if delimiter == "newline" else delimiter
+            for line in file:
+                results.extend(item.strip() for item in line.split(delimiter))
 
-    if delimiter is None:
-        # Remove newlines and excess whitespace
-        content = re.sub(r'\s+', ' ', content.strip())
-
-        # Handle different delimiters and list formats
-        # Removes common list notations like commas, brackets, quotes, etc.
-        items = re.split(r'[,\[\]\(\)\{\}"\'\s]+', content)
-    else:
-        if delimiter == "newline":  # TODO fix this
-            delimiter = "\n"
-        items = [item.strip() for item in content.split(delimiter)]
-
-    # Filter out any empty strings from the list
-    return [item for item in items if item]
+    # Filter empty strings in one step
+    return [item for item in results if item]

@@ -5,7 +5,7 @@ from tqdm import tqdm
 from collections import Counter
 from accelerate import Accelerator
 
-LANGUAGES_TO_DECODE_FROM_BYTES = ["he", "fr", "uk"]
+LANGUAGES_TO_DECODE_FROM_BYTES = ["he", "fr", "uk", "es", "it", "nl"]
 STREAMING_DATASETS = ["fineweb-edu"]
 
 
@@ -132,7 +132,6 @@ def extract_new_words_from_dataset(
         words = word_pattern.findall(text)
         all_words += words
 
-    # all_words = list(dict.fromkeys(all_words))
     word_frequencies = Counter(all_words)
     all_words = list(word_frequencies.keys())
     token_counts = [len(x) for x in tokenizer(all_words, add_special_tokens=False)["input_ids"]]
@@ -140,9 +139,6 @@ def extract_new_words_from_dataset(
 
     new_words = [word for word, count, w_whitespace_count in zip(all_words, token_counts, w_whitespace_token_counts) if ((count > 1) and (w_whitespace_count > 1) and filter_func(word, count))]
     new_words_freq = {word: word_frequencies[word] for word in new_words}
-    # for word, token_count in tqdm(all_words, total=len(all_words), miniters=10, desc="Finding new words...", unit="words"):
-    #     if (not tokenizer.vocab.get(word, False)) and :
-    #         new_words.append(word)
 
     # remove duplicates and return
     return new_words, new_words_freq

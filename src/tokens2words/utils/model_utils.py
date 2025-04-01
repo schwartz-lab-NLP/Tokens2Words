@@ -1,5 +1,5 @@
 from tqdm import tqdm
-from typing import Iterable, List, Union
+from typing import Iterable, Dict, List, Union
 from transformers import PreTrainedModel, PreTrainedTokenizer
 import torch
 from torch import nn
@@ -29,17 +29,14 @@ def extract_token_i_hidden_states(
 
     if layers_to_extract is None:
         layers_to_extract = list(range(1, model.config.num_hidden_layers + 1))  # extract all but initial embeddings
+        if return_dict:
+            layers_to_extract = [0] + layers_to_extract
     all_hidden_states = {layer: [] for layer in layers_to_extract}
 
     with torch.no_grad():
         for i in tqdm(range(0, len(inputs), batch_size), desc="Extracting hidden states", unit="batch", disable=not verbose):
             input_ids = tokenizer(inputs[i:i+batch_size], return_tensors="pt", return_attention_mask=False)['input_ids']
-            try:
-                outputs = model(input_ids.to(device), output_hidden_states=True)
-            except:
-                import pdb; pdb.set_trace()
-                # from transformers import AutoModelForCausalLM
-                # model2 = AutoModelForCausalLM.from_pretrained("meta-llama/Llama-3.1-8B", torch_dtype=torch.bfloat16).to(device)
+            outputs = model(input_ids.to(device), output_hidden_states=True)
             for input_i in range(len(input_ids)):
                 for layer in layers_to_extract:
                     hidden_states = outputs.hidden_states[layer]
@@ -52,6 +49,156 @@ def extract_token_i_hidden_states(
 
     return all_hidden_states
 
+
+def extract_word_mean_hidden_states(
+        model: PreTrainedModel,
+        tokenizer: PreTrainedTokenizer,
+        words: Union[str, List[str]],
+        batch_size: int = 1,
+        layers_to_extract: List[int] = None,
+        return_dict: bool = True,
+        verbose: bool = True,
+) -> Union[Dict[int, torch.Tensor], torch.Tensor]:
+    """
+    Extract the mean hidden state of each word across its tokens and layers.
+
+    Args:
+        model: The pre-trained transformer model
+        tokenizer: The associated tokenizer
+        words: Single word or list of words to process
+        batch_size: Batch size for processing
+        layers_to_extract: Which layers to extract from. If None, extracts all layers
+        return_dict: If True, returns a dict mapping layer numbers to tensors.
+                    If False, concatenates all layers into a single tensor.
+        verbose: Whether to show progress bar
+
+    Returns:
+        Union[Dict[int, torch.Tensor], torch.Tensor]:
+            If return_dict=True: Dict mapping layer numbers to tensors of shape (num_words, hidden_size)
+            If return_dict=False: Tensor of shape (num_layers * num_words, hidden_size)
+    """
+    device = model.device
+    model.eval()
+
+    if isinstance(words, str):
+        words = [words]
+
+    if layers_to_extract is None:
+        layers_to_extract = list(range(1, model.config.num_hidden_layers + 1))
+        if return_dict:
+            layers_to_extract = [0] + layers_to_extract
+
+    # Initialize dict to store results for each layer
+    all_hidden_states = {layer: [] for layer in layers_to_extract}
+
+    with torch.no_grad():
+        for i in tqdm(range(0, len(words), batch_size), desc="Extracting hidden states", unit="batch",
+                      disable=not verbose):
+            batch_words = words[i:i + batch_size]
+
+            # Tokenize without padding
+            encodings = tokenizer(batch_words, return_tensors=None, add_special_tokens=False)
+
+            # Process each word separately since they might have different lengths
+            for word_idx, input_ids in enumerate(encodings['input_ids']):
+                # Convert to tensor and add batch dimension
+                input_ids = torch.tensor(input_ids).unsqueeze(0).to(device)
+
+                # Get hidden states for all tokens
+                outputs = model(input_ids, output_hidden_states=True)
+
+                # Process each layer
+                for layer in layers_to_extract:
+                    # Get hidden states for all tokens in this layer
+                    layer_states = outputs.hidden_states[layer][0]  # remove batch dimension
+                    # Compute mean across tokens for this layer
+                    mean_state = layer_states.mean(dim=0)  # (hidden_size,)
+                    all_hidden_states[layer].append(mean_state.cpu())
+
+    # Convert lists to tensors for each layer
+    for layer in all_hidden_states:
+        all_hidden_states[layer] = torch.stack(all_hidden_states[layer])
+
+    if not return_dict:
+        # Concatenate all layers into a single tensor
+        all_hidden_states = torch.cat([all_hidden_states[layer] for layer in layers_to_extract], dim=0)
+
+    return all_hidden_states
+
+
+def extract_word_mean_embeddings(
+        model: PreTrainedModel,
+        tokenizer: PreTrainedTokenizer,
+        words: Union[str, List[str]],
+        batch_size: int = 1,
+        include_output_embeddings: bool = True,
+        return_dict: bool = True,
+        verbose: bool = True,
+) -> Union[Dict[int, torch.Tensor], torch.Tensor]:
+    """
+    Extract the mean embedding weights for each word's tokens from input and optionally output embeddings.
+
+    Args:
+        model: The pre-trained transformer model
+        tokenizer: The associated tokenizer
+        words: Single word or list of words to process
+        batch_size: Batch size for processing
+        include_output_embeddings: Whether to include output embedding weights
+        return_dict: If True, returns a dict mapping 0 (input embeddings) and -1 (output embeddings)
+                    to tensors. If False, concatenates them.
+        verbose: Whether to show progress bar
+
+    Returns:
+        Union[Dict[int, torch.Tensor], torch.Tensor]:
+            If return_dict=True: Dict mapping 0 (input) and -1 (output) to tensors of shape (num_words, hidden_size)
+            If return_dict=False: Tensor of shape (num_embeddings * num_words, hidden_size)
+    """
+    device = model.device
+    model.eval()
+
+    if isinstance(words, str):
+        words = [words]
+
+    # Get the embedding layers
+    input_embeddings = model.get_input_embeddings()
+    output_embeddings = model.get_output_embeddings() if include_output_embeddings else None
+
+    # Initialize dict to store results
+    all_embeddings = {0: []}  # input embeddings at layer 0
+    if include_output_embeddings and output_embeddings is not None:
+        all_embeddings[-1] = []  # output embeddings at layer -1
+
+    with torch.no_grad():
+        for i in tqdm(range(0, len(words), batch_size), desc="Extracting embeddings", unit="batch",
+                     disable=not verbose):
+            batch_words = words[i:i + batch_size]
+
+            # Tokenize without padding
+            encodings = tokenizer(batch_words, return_tensors=None, add_special_tokens=False)
+
+            # Process each word separately
+            for word_idx, input_ids in enumerate(encodings['input_ids']):
+                # Get input embedding weights for all tokens
+                input_emb = input_embeddings.weight[input_ids]
+                # Compute mean across tokens
+                mean_input_emb = input_emb.mean(dim=0)  # (hidden_size,)
+                all_embeddings[0].append(mean_input_emb.cpu())
+
+                # If using output embeddings, do the same
+                if include_output_embeddings and output_embeddings is not None:
+                    output_emb = output_embeddings.weight[input_ids]
+                    mean_output_emb = output_emb.mean(dim=0)  # (hidden_size,)
+                    all_embeddings[-1].append(mean_output_emb.cpu())
+
+    # Convert lists to tensors
+    for layer in all_embeddings:
+        all_embeddings[layer] = torch.stack(all_embeddings[layer])
+
+    if not return_dict:
+        # Concatenate all embedding types into a single tensor
+        all_embeddings = torch.cat([all_embeddings[layer] for layer in sorted(all_embeddings.keys())], dim=0)
+
+    return all_embeddings
 
 def extract_vocab_hidden_states(
         model: PreTrainedModel,
