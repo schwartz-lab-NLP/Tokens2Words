@@ -6,7 +6,7 @@ cd Tokens2Words/src/
 model="Llama-2-7b-hf"
 model_name="meta-llama/${model}"
 output_dir="Tokens2Words/runs/vocab_expansion/${model}"
-Œ
+
 #dataset="wikitext"
 #data_split="test"
 #data_language="en"
@@ -72,4 +72,4 @@ python -m tokens2words.run_vocab_expansion_eval \
     --eval_dataset "${dataset}" --eval_dataset_split "${data_split}" \
     --eval_max_length "${max_length}" --eval_max_samples 10000 \
     --translators_path "${translators_path}" --translators_use_procrustes --translators_procrustes_normalize  \
-    --patchscopes_results_cache "${patchscopes_cache}"
+    --use_patchscopes --patchscopes_results_cache "${patchscopes_cache}"

@@ -184,7 +184,7 @@ class VocabularyModifier(ABC):
             existing_tokens_for_similarity_loss=None,
     ):
 
-        self.calibrators = self.train_calibrators(
+        _, self.calibrators = self.train_calibrators(
             dataset, save_dir, overwrite_cache, max_samples,
             lr, lr_schedule, num_epochs, batch_size, max_length,
             n_warmup_steps, clip_grad_norm, target_loss_weight,

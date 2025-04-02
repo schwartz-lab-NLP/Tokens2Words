@@ -434,16 +434,16 @@ class CalibrationModel(nn.Module):
         try:
             if self.calibrate_embedding:
                 self.embedding_calibrator = torch.load(
-                    os.path.join(load_dir, "embedding_calibrator.pt"))
+                    os.path.join(load_dir, "embedding_calibrator.pt"), weights_only=False)
                 if hasattr(self, 'existing_tokens_embedding_calibrator'):
                     self.existing_tokens_embedding_calibrator = torch.load(
-                        os.path.join(load_dir, "existing_tokens_embedding_calibrator.pt"))
+                        os.path.join(load_dir, "existing_tokens_embedding_calibrator.pt"), weights_only=False)
             if self.calibrate_lm_head:
                 self.lm_head_calibrator = torch.load(
-                    os.path.join(load_dir, "lm_head_calibrator.pt"))
+                    os.path.join(load_dir, "lm_head_calibrator.pt"), weights_only=False)
                 if hasattr(self, 'existing_tokens_lm_head_calibrator'):
                     self.existing_tokens_lm_head_calibrator = torch.load(
-                        os.path.join(load_dir, "existing_tokens_lm_head_calibrator.pt"))
+                        os.path.join(load_dir, "existing_tokens_lm_head_calibrator.pt"), weights_only=False)
             return True
         except:
             if fail_ok:
