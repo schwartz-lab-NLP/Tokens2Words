@@ -1,0 +1,18 @@
+# LaTeX build products
+*.aux
+*.log
+*.out
+*.bbl
+*.blg
+*.fls
+*.fdb_latexmk
+*.synctex.gz
+*.toc
+main.pdf
+
+# Packaging
+*.zip
+
+# OS / Python cruft
+.DS_Store
+__pycache__/
